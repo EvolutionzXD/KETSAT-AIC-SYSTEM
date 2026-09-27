@@ -1,0 +1,74 @@
+# AI Challenge AIC 2025 — Video Retrieval Baseline
+# Optimized for TP.HCM competition: KIS + TRAKE + QA tasks
+
+uvicorn>=0.27.0
+fastapi>=0.109.0
+streamlit>=1.31.0
+faiss-cpu>=1.7.4
+faiss-gpu>=1.7.4
+torch>=2.0.0
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0
+# Parquet caption_table/frame_mapping (src/data/caption_mapping.py).
+pyarrow>=10.0.0
+Pillow>=10.0.0
+opencv-python>=4.8.0,<5.0.0
+# Qwen3-VL model support; official Qwen3-VL requires Transformers >=4.57.0.
+transformers>=4.57.0
+sentence-transformers>=2.2.0
+diffusers>=0.25.0
+huggingface_hub>=0.20.0
+# >=3.0.0 required for PE-Core configs (src/encoders/pe_core_encoder.py),
+# added in open_clip 3.0.0 (PR #1097).
+open-clip-torch>=3.0.0
+# scripts/upload_frames_to_drive.py (src/storage/gdrive_uploader.py) —
+# per-video frame ZIP upload to a Google Drive folder shared with a
+# service account.
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+httpx>=0.26.0
+aiofiles>=23.0.0
+orjson>=3.9.0
+xxhash>=3.4.0
+cachetools>=5.3.0
+loguru>=0.7.0
+pyyaml>=6.0.0
+easyocr>=1.7.0
+# scripts/extract_audio.py (PhoWhisper ASR -> English translation).
+deep-translator>=1.9.0
+# scripts/extract_scene_graph.py (BLIP caption -> SVO triplets). Pin <3.8 on
+# Python 3.8 servers: spacy>=3.8 needs numpy>=2.0, which has no cp38 wheel
+# (verified on rented GPU 2026-07-21 — plain `pip install spacy` fails build).
+spacy<3.8
+# src/data/egocentric_segmentation.py (kernel change-point event boundaries
+# for continuous, unedited wearable-camera video — CPU-only, no GPU needed).
+# FLOORED again as of 2026-08-03. It was pinned to 1.0.6 because the custom
+# _CostCosine crashed under 1.1.x with "AttributeError: '_CostCosine' object
+# has no attribute 'signal'" (1.1.x's Pelt.predict reads cost.signal, 1.0.6
+# does not). That is fixed at the source — _CostCosine.fit now sets .signal —
+# and both versions were verified to produce identical boundaries.
+#
+# Prefer newer: 1.1.x adds the paper's own KernelCPD(kernel="cosine") in C,
+# which egocentric_segmentation.py uses automatically when present. Measured
+# on the real corpus, it is ~130x faster (L25_V054, 12,591 frames: ~55 min
+# via the Python cost, 25 s native), which is the difference between a KCP
+# run of days and one of about an hour.
+#
+# Environments without a wheel still resolve to 1.0.6 and take the Python
+# path: 1.1.9 publishes nothing newer than cp312, so a Python 3.13+ dev
+# machine would have to compile from source. The UIT server (Python 3.8,
+# Linux) has a wheel and gets the fast path.
+ruptures>=1.0.6
+# BGE-M3 query-time encoder for search_audio() (semantic ASR over 20s
+# segments, see scripts/build_asr_bge_index.py / src/pipeline/resource_manager.py
+# load_bge_m3_encoder). Must match the encode() call signature used offline
+# by scripts/embed_bge_m3.py.
+FlagEmbedding>=1.2.0
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+torchscale

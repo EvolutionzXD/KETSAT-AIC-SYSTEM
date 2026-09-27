@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AIC 2026 · Final Retrieval</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e88e5'/%3E%3Cpath d='M18 4 8 18h7l-2 10 11-15h-7z' fill='%23fff'/%3E%3C/svg%3E" />
+  <!-- Font là tuỳ chọn: mạng LAN không có internet vẫn chạy bằng font hệ thống. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=final-8" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ═════════════ BÊN TRÁI: task + truy vấn (giống bản RRF cũ) ═════════════ -->
+  <aside class="sidebar">
+    <div class="sb-head">
+      <button class="brand" id="btnHelp" title="Bấm để xem phím tắt">⚡ AIC 2026</button>
+      <div class="spacer"></div>
+      <button class="icon" id="btnSettings" title="Cài đặt">⚙️</button>
+    </div>
+
+    <div class="sb-body">
+      <div class="tabs" id="taskTabs">
+        <button data-task="kis" class="active" title="KIS / VKIS — tìm một khoảnh khắc, nộp start = end (phím 1)">KIS</button>
+        <button data-task="vqa" title="Q&amp;A — tìm frame rồi trả lời (phím 2)">Q&amp;A</button>
+        <button data-task="trake" title="TRAKE — chuỗi sự kiện trong một video (phím 3)">TRAKE</button>
+        <button id="videoTab" title="Mở video trực tiếp bằng Video ID">▶ VIDEO</button>
+      </div>
+
+      <!-- VIDEO: mở video trực tiếp -->
+      <section class="card" id="paneVideo" hidden>
+        <div class="sec-title">Mở video trực tiếp</div>
+        <div class="form">
+          <label for="vsId">Video ID</label>
+          <input id="vsId" placeholder="Ví dụ: L21_V001, N051-V001" spellcheck="false" autocomplete="off">
+          <label for="vsTime">Bắt đầu tại giây</label>
+          <input id="vsTime" type="number" min="0" step="0.1" value="0">
+          <button class="btn primary big" id="vsOpen">▶ Mở video</button>
+          <p class="hint">Tua đến cảnh cần lấy rồi dùng “Add to Answer” trong Frame Calc.</p>
+        </div>
+      </section>
+
+      <div id="searchBox">
+        <!-- KIS / Q&A -->
+        <section class="card" id="paneQuery">
+          <div class="sec-title">Chế độ tìm kiếm <span id="modeBadge" class="pill">Late / RRF</span></div>
+          <div class="seg" id="familySeg">
+            <button data-family="standard" class="active">Standard</button>
+            <button data-family="multi">Multi-mode</button>
+            <button data-family="video_lock">Lock-video</button>
+          </div>
+          <div class="seg sub" data-fam="standard">
+            <button data-fusion="late" class="active">Late Fusion / RRF</button>
+            <button data-fusion="early">Early Fusion</button>
+          </div>
+          <div class="seg sub" data-fam="multi" hidden>
+            <button data-mm="only_visual" class="active">Only Visual</button>
+            <button data-mm="visual_ocr">Visual + OCR</button>
+            <button data-mm="visual_asr">Visual + ASR</button>
+          </div>
+          <div class="note" data-fam="video_lock" hidden>DeepSeek Vision: bật mặc định · VTG: không sử dụng</div>
+
+          <div class="sec-title" style="margin-top:.55rem">
+            <span id="queryLabel">Mô tả cảnh</span>
+            <button class="btn xs ghost" data-grow="query" title="Kéo dài / thu gọn">⤢</button>
+          </div>
+          <textarea id="query" rows="6" spellcheck="false"
+            placeholder="Nhập mô tả cảnh cần tìm...&#10;Enter: tìm · Shift+Enter: xuống dòng&#10;Chữ OCR/ASR đặt trong &quot;ngoặc kép&quot;."></textarea>
+        </section>
+
+        <!-- TRAKE -->
+        <section class="card" id="paneTrake" hidden>
+          <div class="sec-title">Số sự kiện
+            <span class="stepper">
+              <button id="evDec" aria-label="Giảm số sự kiện">−</button>
+              <input id="evCount" type="number" min="1" max="10" value="2">
+              <button id="evInc" aria-label="Tăng số sự kiện">+</button>
+            </span>
+          </div>
+          <details class="anchor" id="anchorBox" open>
+            <summary>Anchor TRAKE <span class="muted">(tùy chọn)</span></summary>
+            <div class="anchor-grid">
+              <label for="anVideo">Anchor video</label>
+              <div class="row"><input id="anVideo" placeholder="Ví dụ: L27_V011" spellcheck="false"><button class="btn xs" id="anOpen" title="Có Video ID: mở video đó; để trống: lấy video đang xem">Mở</button></div>
+              <label for="anFrame">Anchor frame</label>
+              <div class="row"><input id="anFrame" type="number" min="0" placeholder="Tùy chọn"><button class="btn xs" id="anClear">Xóa</button></div>
+              <label for="anQuery">Anchor query</label>
+              <input id="anQuery" placeholder="Mô tả đoạn anchor (tùy chọn)">
+            </div>
+            <p class="hint" id="anHint">Để trống các trường anchor để tìm TRAKE tự động.</p>
+          </details>
+          <div id="evList" class="ev-list"></div>
+          <p class="hint">Dán cả đoạn có xuống dòng hoặc “-&gt;” vào E1 để tự tách sự kiện.</p>
+        </section>
+
+        <div class="btn-card">
+          <button class="btn primary big" id="btnSearch">🔍 Tìm kiếm <kbd>Enter</kbd></button>
+          <button class="btn gold big" id="btnDeepseek" hidden title="Dùng video/frame anchor đã chọn để lọc TRAKE bằng DeepSeek">✨ Tìm DeepSeek</button>
+          <div class="row" id="filterRow">
+            <button class="btn grow" id="btnFilter" title="Chọn video từ kết quả rồi lọc frame tốt nhất (Ctrl+Enter)">⛃ Lọc frame tốt nhất <b id="selCount"></b></button>
+            <button class="btn" id="btnRestore" hidden title="Quay lại kết quả search ban đầu">↶ Kết quả gốc</button>
+          </div>
+          <label class="switch-row"><input type="checkbox" id="translate" checked><span class="sw"></span> Dịch VI → EN <kbd>Alt+E</kbd></label>
+        </div>
+      </div>
+
+      <!-- Lịch sử truy vấn -->
+      <section class="card hist">
+        <div class="sec-title">
+          <span class="tabs mini" id="histTabs"><button data-h="me" class="active">Queries History</button><button data-h="team">Team</button></span>
+          <button class="btn xs ghost" id="histClear" title="Xóa lịch sử của tôi">🗑</button>
+        </div>
+        <div id="histList" class="hist-list"></div>
+      </section>
+    </div>
+  </aside>
+
+  <!-- ═════════════ GIỮA ═════════════ -->
+  <div class="main">
+    <header class="topbar">
+      <span class="pill api" title="Trạng thái API"><span id="health" class="dot"></span>API</span>
+      <button class="pill team" id="teamBadge" title="Bấm để chọn tên của bạn">👥 Chưa chọn tên</button>
+      <button class="pill gold" id="trakeLockPill" hidden></button>
+      <div class="quick" title="Mở nhanh: L21_V001 · L21_V001 1:30 · L21_V001 #2250 (frame)">
+        <span>🎬</span>
+        <input id="quickVideo" placeholder="L21_V001 1:30 · #frame" spellcheck="false" autocomplete="off">
+        <button class="btn xs primary" id="quickGo">Mở</button>
+      </div>
+      <div class="spacer"></div>
+      <label class="switch-row" title="Xem theo video (Alt+W)"><input type="checkbox" id="viewToggle"><span class="sw"></span> Theo video</label>
+      <button class="btn sm" id="btnDres" title="Đăng nhập DRES">🔑 DRES</button>
+      <button class="btn sm" id="btnCart" title="Mở/đóng danh sách nộp (Alt+A) — kéo thả frame vào đây">📤 Xuất <b id="cartCount">0</b></button>
+      <button class="btn sm primary" id="btnSubmit" title="Nộp mục #1 lên DRES (Ctrl+S)">✅ Nộp bài</button>
+    </header>
+
+    <main class="content" id="content">
+      <div class="toolbar">
+        <div class="txbar" id="txBar">
+          <span class="tx-ico">✨</span>
+          <input id="txQuery" placeholder="Tìm chữ OCR / lời thoại ASR trong K kết quả (vd: vtv, cứu hỏa)…" spellcheck="false" autocomplete="off">
+          <select id="txSrc" title="Nguồn chữ">
+            <option value="all">OCR + ASR</option>
+            <option value="ocr">Chỉ OCR</option>
+            <option value="asr">Chỉ ASR</option>
+          </select>
+          <select id="txScope" title="Phạm vi so khớp">
+            <option value="video">Cả video</option>
+            <option value="near">±10s quanh frame</option>
+          </select>
+          <label class="chk"><input type="checkbox" id="txOnly"> Chỉ hiện khớp</label>
+          <label class="chk" title="Hiện OCR/ASR gần nhất dưới mỗi ảnh"><input type="checkbox" id="txShow"> Hiện chữ</label>
+          <span id="txBadge" class="tx-badge" hidden></span>
+          <button class="btn xs ghost" id="txClear" hidden>✕</button>
+        </div>
+        <div class="viewctl">
+          <span class="pill ultra" id="countBadge">0 kết quả</span>
+          <span id="summary" class="muted"></span>
+          <input type="range" id="cardSize" min="100" max="320" step="10" title="Kích thước ảnh">
+          <label class="chk" title="Di chuột lên ảnh để phát video quanh frame đó"><input type="checkbox" id="hoverPlay" checked> ▶ Hover</label>
+        </div>
+      </div>
+
+      <!-- Preview như bản cũ: trái = ảnh đang trỏ (giữ Alt / Alt+X), phải = frame đang chọn trong dải frame (↑) -->
+      <section class="preview" id="preview" hidden>
+        <div class="pv" id="pvLeft" hidden><img alt="" draggable="true"><span class="pv-cap"></span><button class="pv-x" title="Đóng">✕</button></div>
+        <div class="pv" id="pvRight" hidden><img alt="" draggable="true"><span class="pv-cap"></span><button class="pv-x" title="Đóng">✕</button></div>
+      </section>
+
+      <div id="results"></div>
+    </main>
+
+    <!-- Dải keyframe (chuột phải vào ảnh) -->
+    <section id="strip" class="strip" hidden>
+      <div class="strip-head">
+        <b id="stripTitle"></b>
+        <span class="muted">← → chọn · ↑ xem lớn · ↓ ẩn xem · = thêm · chuột phải: phát video</span>
+        <div class="spacer"></div>
+        <button class="btn xs" id="stripPrev" title="Chuyển tới keyframe trước">← Trước</button>
+        <button class="btn xs" id="stripNext" title="Chuyển tới keyframe sau">Sau →</button>
+        <button class="btn xs" id="stripBig" title="Hiện frame đang chọn ở khung xem lớn">↑ Xem lớn</button>
+        <button class="btn xs" id="stripHide" title="Ẩn khung xem lớn">↓ Ẩn xem</button>
+        <button class="btn xs" id="stripView"></button>
+        <button class="btn xs primary" id="stripAdd" title="Thêm frame đang chọn (=)">＋ Thêm</button>
+        <button class="btn xs" id="stripPlay">▶ Video</button>
+        <button class="icon" id="stripClose" title="Đóng dải keyframe (Esc)">✕</button>
+      </div>
+      <div class="strip-frames" id="stripFrames"></div>
+    </section>
+  </div>
+
+  <!-- ═════════════ BÊN PHẢI: danh sách nộp (export area) ═════════════ -->
+  <aside class="cart" id="cart">
+    <div class="cart-head">
+      <div class="tabs mini" id="cartTabs">
+        <button data-task="kis" class="active">KIS</button><button data-task="vqa">Q&amp;A</button><button data-task="trake">TRAKE</button>
+      </div>
+      <div class="spacer"></div>
+      <button class="icon on" id="cartShare" title="Chia sẻ danh sách với team: BẬT">🔗</button>
+      <button class="icon" id="cartClear" title="Xóa hết (Alt+S)">🗑</button>
+      <button class="icon" id="cartWide" title="Mở rộng / thu gọn">⤢</button>
+      <button class="btn xs primary" id="cartCsv" title="Tải file CSV / Lưu SOLOAI">CSV</button>
+      <button class="icon" id="cartClose" title="Đóng (Alt+A)">✕</button>
+    </div>
+    <div class="cart-list" id="cartList"></div>
+    <div class="cart-foot">
+      <div class="tm" id="trakeManual" hidden>
+        <div class="tm-title">✍ Nộp tay TRAKE</div>
+        <div class="row"><input id="tmVideo" placeholder="Video ID" spellcheck="false" autocomplete="off"><input id="tmFrames" placeholder="frame1, frame2, …" spellcheck="false" autocomplete="off"></div>
+        <div class="tm-preview muted" id="tmPreview"></div>
+        <div class="row"><button class="btn xs grow" id="tmAdd" title="Thêm các frame này vào danh sách nộp (để xem ảnh / kéo đổi thứ tự)">＋ Vào danh sách</button><button class="btn xs primary grow" id="tmSubmit" title="Nộp thẳng chuỗi TR-… lên DRES">✅ Nộp tay</button></div>
+      </div>
+      <button class="btn sm undo" id="cartUndo" hidden></button>
+      <button class="btn sm" id="cartManual" title="Nộp frame thủ công (Alt+M)">✍️ Thủ công</button>
+      <button class="btn sm primary grow" id="cartSubmit">✅ Nộp bài</button>
+    </div>
+  </aside>
+</div>
+
+<!-- ═════════════ XEM VIDEO (kéo thanh tiêu đề để di chuyển) ═════════════ -->
+<div id="videoModal" class="overlay">
+  <div class="win video-win" id="vmWin">
+    <div class="win-head drag" title="Kéo để di chuyển">
+      <h3 id="vmTitle">Video</h3>
+      <span class="pill ultra" id="vmBadge"></span>
+      <div class="spacer"></div>
+      <button class="icon" data-close title="Đóng (Esc)">✕</button>
+    </div>
+    <div class="vm-body">
+      <div class="vm-left">
+        <div class="player"><video id="vmVideo" controls preload="auto"></video></div>
+        <div class="scrub">
+          <button class="btn xs" data-step="-10" title="Lùi 10 giây (← : lùi 5 giây)">⏪</button>
+          <button class="btn xs" id="vmRestart" title="Về thời điểm ban đầu">⟲</button>
+          <button class="btn xs" data-step="10" title="Tới 10 giây (→ : tới 5 giây)">⏩</button>
+          <button class="btn xs" data-stepf="-1" title="Lùi 1 frame">◀ 1f</button>
+          <button class="btn xs" data-stepf="1" title="Tới 1 frame">1f ▶</button>
+          <select id="vmSpeed" title="Tốc độ phát (phím 1–4 · giữ Shift: x1.5 · giữ Shift+Z: x2)">
+            <option value="0.5">0.5x</option><option value="1" selected>1x</option>
+            <option value="1.5">1.5x</option><option value="2">2x</option>
+          </select>
+        </div>
+      </div>
+      <div class="vm-right">
+        <div class="tabs" id="vmTabs">
+          <button data-vt="calc" class="active">🎯 Frame Calc</button>
+          <button data-vt="text">📝 ASR / OCR</button>
+        </div>
+        <div class="vt" id="vtCalc">
+          <h4>Add Frame Here</h4>
+          <div class="calc-row"><span>Video ID</span><b id="vcId">—</b></div>
+          <div class="calc-row"><span>Time</span><b><span id="vmTime">0.00</span>s</b></div>
+          <div class="calc-row"><span>Frame Index</span><b class="tc-frame" id="vmFrame">—</b></div>
+          <div class="calc-row goto"><span>Đến frame <kbd>G</kbd></span><input id="vmGoto" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="gõ số frame ↵" title="Gõ số frame rồi Enter để nhảy tới (video dừng tại đó)"></div>
+          <div class="calc-row"><span>FPS</span><span class="muted" id="vmFps"></span></div>
+          <input id="vmAnswer" placeholder="Câu trả lời Q&amp;A — nộp dạng QA-&lt;đáp án&gt;-&lt;video&gt;-&lt;ms&gt;" hidden>
+          <button class="btn primary big" id="vmAdd">⊕ Add to Answer <kbd>C</kbd></button>
+          <button class="btn big" id="vmSubmit">✅ Nộp bài frame này <kbd>S</kbd></button>
+          <div class="row">
+            <button class="btn grow" id="vmStrip">☰ Frame lân cận</button>
+            <button class="btn grow" id="vmAnchor">⚓ Anchor TRAKE</button>
+          </div>
+        </div>
+        <div class="vt insp" id="vtText" hidden>
+          <div class="insp-head">
+            <input id="inspQuery" placeholder="Tìm trong lời thoại &amp; chữ trên màn hình…" spellcheck="false">
+            <span class="spinner sm" id="inspSpin" hidden></span>
+          </div>
+          <div class="tabs mini" id="inspTabs">
+            <button data-f="all" class="active">Tất cả</button>
+            <button data-f="asr">ASR</button>
+            <button data-f="ocr">OCR</button>
+          </div>
+          <ul class="insp-list" id="inspList"></ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Xem toàn màn hình -->
+<div id="lightbox" class="overlay lb">
+  <button class="lb-nav" id="lbPrev" title="←">‹</button>
+  <figure><img id="lbImg" alt=""><figcaption id="lbCap"></figcaption></figure>
+  <button class="lb-nav" id="lbNext" title="→">›</button>
+  <div class="lb-actions">
+    <button class="btn primary" id="lbAdd">＋ Thêm <kbd>=</kbd></button>
+    <button class="btn" id="lbOpen">▶ Mở video</button>
+    <button class="btn" data-close>✕ Đóng</button>
+  </div>
+</div>
+
+<!-- DRES -->
+<div id="dresModal" class="overlay">
+  <div class="win small">
+    <div class="win-head"><h3>🔑 Đăng nhập DRES</h3><div class="spacer"></div><button class="icon" data-close>✕</button></div>
+    <div class="win-body form" id="dresBody"></div>
+  </div>
+</div>
+
+<!-- Submit thủ công -->
+<div id="manualSubmitModal" class="overlay">
+  <div class="win small">
+    <div class="win-head"><h3>✍️ Nộp / Thêm Frame thủ công <kbd>Alt+M</kbd></h3><div class="spacer"></div><button class="icon" data-close>✕</button></div>
+    <div class="win-body form">
+      <p class="hint">Nhập thông tin Video ID và Frame ID để nộp ngay sang DRES hoặc thêm vào danh sách.</p>
+      <label for="msVideoId">Video ID (vd: <code>L01_V001</code>, <code>K01_V001</code>)</label>
+      <input id="msVideoId" placeholder="L01_V001" spellcheck="false" autocomplete="off">
+      <label for="msFrameId">Frame ID (hoặc thời gian mm:ss, vd: <code>1500</code> hoặc <code>01:30</code>)</label>
+      <input id="msFrameId" placeholder="1500" spellcheck="false" autocomplete="off">
+      <div id="msAnswerRow" style="display:none;">
+        <label for="msAnswer">Câu trả lời (cho Q&A / VQA)</label>
+        <input id="msAnswer" placeholder="Nhập đáp án..." spellcheck="false">
+      </div>
+      <div class="row end" style="margin-top: 14px; gap: 8px;">
+        <button class="btn" id="msBtnAdd">➕ Thêm vào giỏ</button>
+        <button class="btn primary" id="msBtnSubmit">🚀 Nộp DRES ngay</button>
+        <button class="btn" data-close>Đóng</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- CSV / SOLOAI -->
+<div id="csvModal" class="overlay">
+  <div class="win small">
+    <div class="win-head"><h3>Tải kết quả CSV</h3><div class="spacer"></div><button class="icon" data-close>✕</button></div>
+    <div class="win-body form">
+      <p class="hint">Tên file phải khớp tên truy vấn, ví dụ: <code>query-p1-25-kis.csv</code></p>
+      <input id="csvName" placeholder="query-...-kis.csv" spellcheck="false">
+      <div class="row end">
+        <button class="btn primary" id="csvDownload">Tải xuống</button>
+        <button class="btn gold" id="csvSolo">Lưu SOLOAI</button>
+        <button class="btn" data-close>Hủy</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Cài đặt -->
+<div id="settingsModal" class="overlay">
+  <div class="win small">
+    <div class="win-head"><h3>⚙️ Cài đặt</h3><div class="spacer"></div><button class="icon" data-close>✕</button></div>
+    <div class="win-body form">
+      <label for="setName">Tên của bạn (hiện cho cả team)</label>
+      <input id="setName" placeholder="vd: Tri">
+      <label for="setBackend">Backend API</label>
+      <input id="setBackend" placeholder="http://localhost:8602" spellcheck="false">
+      <div id="dirBox" hidden>
+        <label for="dirAdd">📁 Thư mục video trên máy (ổ khác cũng được)</label>
+        <div id="dirList" class="dir-list"></div>
+        <div class="row"><input id="dirAdd" placeholder="Dán đường dẫn, vd E:\AIC\batch2" spellcheck="false" autocomplete="off"><button class="btn sm" id="dirAddBtn">＋ Thêm</button></div>
+        <p class="hint">Quét cả thư mục con (5 cấp) · tên file = Video ID · lưu trong <code>data/video_dirs.txt</code>, có hiệu lực ngay.</p>
+      </div>
+      <p class="hint">Cũng có thể dùng <code>?backend=…&amp;dres=…</code> trên URL. Video/ảnh: <code>server.py</code> lấy ở máy trước (<code>data/batch1</code>, <code>data/batch2</code>), thiếu thì lấy từ backend.</p>
+      <div class="row end"><button class="btn" data-close>Hủy</button><button class="btn primary" id="setSave">Lưu</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- Phím tắt -->
+<div id="helpModal" class="overlay">
+  <div class="win small">
+    <div class="win-head"><h3>Keyboard Shortcuts</h3><div class="spacer"></div><button class="icon" data-close>✕</button></div>
+    <div class="win-body help" id="helpBody"></div>
+  </div>
+</div>
+
+<!-- TRAKE workspace của team (app.js vẽ) -->
+<aside id="trakeWs" class="tws"></aside>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="app.js?v=final-8"></script>
+</body>
+</html>

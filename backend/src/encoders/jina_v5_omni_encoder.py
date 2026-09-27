@@ -1,0 +1,283 @@
+"""Jina Embeddings v5 Omni image/text encoder.
+
+Unlike Jina CLIP v2, v5 Omni routes media tokens through the Jina v5 text
+backbone.  Retrieval therefore needs the model's explicit Query/Document
+protocol: candidate frames are encoded as documents and user queries as
+queries.
+"""
+
+from typing import Any, Literal, Optional, Sequence
+
+import numpy as np
+import torch
+from loguru import logger
+
+from src.encoders.base import VisualTextEncoder
+
+
+DEFAULT_JINA_V5_OMNI_MODEL_ID = (
+    "jinaai/jina-embeddings-v5-omni-nano-retrieval"
+)
+JINA_V5_OMNI_NANO_MODEL_ID = DEFAULT_JINA_V5_OMNI_MODEL_ID
+JINA_V5_OMNI_SMALL_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small"
+JINA_V5_OMNI_IMAGE_PLACEHOLDER = (
+    "<|vision_start|><|image_pad|><|vision_end|>"
+)
+JINA_V5_OMNI_NANO_IMAGE_PLACEHOLDER = "<image>"
+
+
+class JinaV5OmniEncoder(VisualTextEncoder):
+    """Lazy-loading Jina v5 Omni encoder for text-to-image retrieval."""
+
+    def __init__(
+        self,
+        model_id: str = DEFAULT_JINA_V5_OMNI_MODEL_ID,
+        device: Optional[torch.device] = None,
+        fp16: bool = False,
+        truncate_dim: Optional[int] = None,
+        modality: Literal["vision", "text"] = "vision",
+    ):
+        if not model_id.strip():
+            raise ValueError("model_id must be non-empty")
+        if truncate_dim is not None and truncate_dim <= 0:
+            raise ValueError("truncate_dim must be positive")
+        if modality not in ("vision", "text"):
+            raise ValueError("modality must be 'vision' or 'text'")
+
+        self._model_id = model_id
+        self._device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        if fp16 and self._device.type != "cuda":
+            raise ValueError("fp16=True requires a CUDA device")
+        self._fp16 = bool(fp16)
+        self._truncate_dim = truncate_dim
+        # The official v5 Omni checkpoint uses separate modality-specific
+        # runtime adapters.  Image features are built with ``vision`` while
+        # backend query embeddings must use ``text``.  Keep ``vision`` as the
+        # default for backwards-compatible candidate-frame extraction.
+        self._modality = modality
+        self._model = None
+        self._processor = None
+        self._embedding_dim: Optional[int] = None
+
+    @property
+    def encoder_type(self) -> str:
+        if "omni-nano" in self._model_id:
+            return "jina_v5_omni_nano"
+        if "omni-small" in self._model_id:
+            return "jina_v5_omni_small"
+        return "jina_v5_omni"
+
+    @property
+    def checkpoint(self) -> str:
+        truncate = self._truncate_dim if self._truncate_dim is not None else "full"
+        return (
+            f"{self._model_id}|task=retrieval|modality={self._modality}|"
+            f"truncate_dim={truncate}"
+        )
+
+    @property
+    def embedding_dim(self) -> int:
+        self._load()
+        return self._embedding_dim
+
+    def metadata(self):
+        metadata = super().metadata()
+        metadata.update(
+            {
+                "model_id": self._model_id,
+                "task": "retrieval",
+                "modality": self._modality,
+                "device": str(self._device),
+                "fp16": self._fp16,
+                "truncate_dim": self._truncate_dim,
+            }
+        )
+        return metadata
+
+    def _load(self):
+        if self._model is not None:
+            return self._model, self._processor
+
+        try:
+            from transformers import AutoModel
+        except ImportError as exc:
+            raise ImportError(
+                f"Jina v5 Omni dependencies are missing ({exc}). Install "
+                "transformers>=5.1 and torch>=2.5."
+            ) from exc
+
+        logger.info(
+            f"Loading Jina v5 Omni model: {self._model_id} on {self._device}"
+        )
+        load_kwargs = {
+            "trust_remote_code": True,
+            # We only need vision + text; omitting the audio tower saves
+            # memory and makes the model practical on 11 GB RTX 2080 Ti GPUs.
+            "modality": self._modality,
+        }
+        # The base omni repository contains task adapters and needs an
+        # explicit task. The pre-merged *-retrieval checkpoint does not accept
+        # that constructor argument.
+        if not self._model_id.endswith("-retrieval"):
+            load_kwargs["default_task"] = "retrieval"
+        if self._fp16:
+            # Transformers 5.x uses ``dtype``; ``torch_dtype`` still works but
+            # emits a deprecation warning and can hide a wrong runtime choice.
+            load_kwargs["dtype"] = torch.float16
+
+        model = AutoModel.from_pretrained(self._model_id, **load_kwargs)
+        # The retrieval checkpoint ships a multimodal processor config which
+        # references Qwen3VLVideoProcessor.  That processor is not available
+        # in the server's Transformers runtime (4.57.6), and it is not needed
+        # for this backend: the indexed vectors are already built offline and
+        # online requests only need the text adapter.  Loading AutoProcessor
+        # here therefore makes an otherwise valid text model fail at startup.
+        # Use the tokenizer directly for text modality; it produces exactly
+        # the input_ids/attention_mask consumed by model.embed(). Keep the
+        # multimodal processor path for explicit vision/image use.
+        if self._modality == "text":
+            from transformers import AutoTokenizer
+
+            try:
+                processor = AutoTokenizer.from_pretrained(
+                    self._model_id,
+                    trust_remote_code=True,
+                    use_fast=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Jina tokenizer fast load failed; retrying slow tokenizer: {}",
+                    exc,
+                )
+                processor = AutoTokenizer.from_pretrained(
+                    self._model_id,
+                    trust_remote_code=True,
+                    use_fast=False,
+                )
+        else:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                self._model_id, trust_remote_code=True
+            )
+        model = model.to(self._device)
+        model.eval()
+        self._model = model
+        self._processor = processor
+
+        probe = self._embed_text_batch(["Query: warmup"])
+        self._embedding_dim = int(probe.shape[1])
+        logger.info(
+            f"Jina v5 Omni loaded on {self._device}, "
+            f"embedding_dim={self._embedding_dim}"
+        )
+        return self._model, self._processor
+
+    def _move_batch_to_device(self, batch: Any) -> Any:
+        if hasattr(batch, "to"):
+            return batch.to(self._device)
+        return {
+            key: value.to(self._device) if hasattr(value, "to") else value
+            for key, value in batch.items()
+        }
+
+    @staticmethod
+    def _as_embedding_array(values: Any) -> np.ndarray:
+        if isinstance(values, dict):
+            for key in ("embeddings", "sentence_embedding", "embedding"):
+                if key in values:
+                    values = values[key]
+                    break
+        if isinstance(values, (tuple, list)):
+            values = values[0]
+        if isinstance(values, torch.Tensor):
+            values = values.detach().float().cpu().numpy()
+        return np.asarray(values, dtype=np.float32)
+
+    @classmethod
+    def _coerce_embeddings(
+        cls,
+        values: Any,
+        expected_count: int,
+        context: str,
+        truncate_dim: Optional[int] = None,
+    ) -> np.ndarray:
+        embeddings = cls._as_embedding_array(values)
+        if expected_count == 1 and embeddings.ndim == 1:
+            embeddings = embeddings.reshape(1, -1)
+        if embeddings.ndim != 2 or embeddings.shape[0] != expected_count:
+            raise RuntimeError(
+                f"Jina v5 Omni returned an invalid {context} shape: "
+                f"expected ({expected_count}, D), got {embeddings.shape}"
+            )
+        if truncate_dim is not None:
+            if truncate_dim > embeddings.shape[1]:
+                raise RuntimeError(
+                    f"truncate_dim={truncate_dim} exceeds returned width "
+                    f"{embeddings.shape[1]}"
+                )
+            embeddings = embeddings[:, :truncate_dim]
+        if not np.isfinite(embeddings).all():
+            raise RuntimeError(
+                "Jina v5 Omni returned NaN/Inf embeddings. Check the "
+                "Transformers/model-code versions and precision setting."
+            )
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        if np.any(norms <= 0):
+            raise RuntimeError(
+                f"Jina v5 Omni returned a zero-norm embedding for {context}"
+            )
+        return (embeddings / norms).astype(np.float32, copy=False)
+
+    def _embed_text_batch(self, prompts: Sequence[str]) -> np.ndarray:
+        model, processor = self._model, self._processor
+        batch = processor(
+            text=list(prompts),
+            return_tensors="pt",
+            padding=True,
+        )
+        batch = self._move_batch_to_device(batch)
+        with torch.inference_mode():
+            values = model.embed(**batch)
+        return self._coerce_embeddings(
+            values, len(prompts), "text batch", self._truncate_dim
+        )
+
+    def _embed_image_batch(self, images: Sequence[Any]) -> np.ndarray:
+        model, processor = self._model, self._processor
+        placeholder = (
+            JINA_V5_OMNI_NANO_IMAGE_PLACEHOLDER
+            if "omni-nano" in self._model_id
+            else JINA_V5_OMNI_IMAGE_PLACEHOLDER
+        )
+        prompts = [
+            f"Document: {placeholder}"
+            for _ in images
+        ]
+        batch = processor(
+            images=list(images),
+            text=prompts,
+            return_tensors="pt",
+            padding=True,
+        )
+        batch = self._move_batch_to_device(batch)
+        with torch.inference_mode():
+            values = model.embed(**batch)
+        return self._coerce_embeddings(
+            values, len(images), "image batch", self._truncate_dim
+        )
+
+    def encode_images(self, images: Sequence[Any]) -> np.ndarray:
+        if not images:
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
+        self._load()
+        return self._embed_image_batch(images)
+
+    def encode_texts(self, texts: Sequence[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
+        self._load()
+        prompts = [f"Query: {text}" for text in texts]
+        return self._embed_text_batch(prompts)

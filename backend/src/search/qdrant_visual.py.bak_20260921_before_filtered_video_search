@@ -1,0 +1,184 @@
+"""Read-only REST adapter for the Final_AIC Qdrant visual lanes.
+
+The adapter deliberately implements the small ``index.search`` contract used
+by the stable RRF code.  Its returned IDs are canonical ``video_id_frame_id``
+keys from the Qdrant payload, so the existing fusion and frame-mapping logic
+does not need to know whether the source is FAISS or Qdrant.  REST is used
+instead of importing ``qdrant-client`` because the server's vendored client
+currently imports an unavailable gRPC module even for HTTP-only use.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+from typing import Any, Optional, Tuple
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import numpy as np
+
+
+class QdrantVisualIndex:
+    """Lazy, read-only full-frame Qdrant collection wrapper."""
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        collection: str,
+        dimension: int,
+        timeout_seconds: float = 30.0,
+        vendor_path: Optional[str] = None,
+        exact: bool = True,
+        hnsw_ef: int = 128,
+    ) -> None:
+        self.url = str(url).rstrip("/")
+        self.collection = str(collection)
+        self.dimension = int(dimension)
+        self.timeout_seconds = float(timeout_seconds)
+        self.exact = bool(exact)
+        self.hnsw_ef = int(hnsw_ef)
+        self.vendor_path = vendor_path or os.environ.get(
+            "QDRANT_CLIENT_VENDOR_PATH",
+            "/home/bachdx/Final_AIC/backend/vendor/python",
+        )
+        self._checked = False
+        # Existing Batch1 collections use Qdrant's unnamed/default vector;
+        # new Final_AIC collections use the explicit ``embedding`` name.
+        self._using: Optional[str] = None
+
+    def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
+        request = urllib.request.Request(
+            self.url + path,
+            data=(
+                json.dumps(body, separators=(",", ":")).encode("utf-8")
+                if body is not None else None
+            ),
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                value = json.load(response)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                "Qdrant %s %s failed: HTTP %d: %s"
+                % (method, path, error.code, detail[:500])
+            ) from error
+        except (urllib.error.URLError, ValueError) as error:
+            raise RuntimeError(
+                "Qdrant %s %s failed: %s" % (method, path, error)
+            ) from error
+        if not isinstance(value, dict):
+            raise RuntimeError("Qdrant returned a non-object response")
+        return value
+
+    def _check_collection(self) -> None:
+        if self._checked:
+            return
+        encoded = urllib.parse.quote(self.collection, safe="")
+        info = self._request("GET", "/collections/" + encoded)
+        result = info.get("result", {})
+        vectors = result.get("config", {}).get("params", {}).get("vectors")
+        if not isinstance(vectors, dict):
+            raise RuntimeError(
+                "Qdrant collection %s has an unreadable vector schema"
+                % self.collection
+            )
+        # REST represents an unnamed vector as {size, distance}; named
+        # vectors are a mapping keyed by vector name.
+        if "size" in vectors:
+            configured = vectors
+            self._using = None
+        elif "embedding" in vectors:
+            configured = vectors["embedding"]
+            self._using = "embedding"
+        else:
+            raise RuntimeError(
+                "Qdrant collection %s must expose named vector 'embedding'"
+                % self.collection
+            )
+        if not isinstance(configured, dict):
+            raise RuntimeError(
+                "Qdrant collection %s has an unreadable vector schema"
+                % self.collection
+            )
+        size = int(configured.get("size", 0))
+        if size != self.dimension:
+            raise RuntimeError(
+                "Qdrant collection %s dimension %d != %d"
+                % (self.collection, size, self.dimension)
+            )
+        self._checked = True
+
+    @staticmethod
+    def _frame_key(payload: Any) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("frame_key")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        video_id = payload.get("video_id")
+        frame_id = payload.get("frame_id")
+        if video_id is None or frame_id is None:
+            return None
+        try:
+            return "%s_%d" % (str(video_id), int(frame_id))
+        except (TypeError, ValueError):
+            return None
+
+    def search(self, query_vector: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Return FAISS-compatible ``(scores, string_ids)`` arrays."""
+        vector = np.asarray(query_vector, dtype=np.float32).reshape(-1)
+        if vector.shape != (self.dimension,):
+            raise ValueError(
+                "Qdrant query dimension %d != %d"
+                % (vector.shape[0], self.dimension)
+            )
+        if not np.isfinite(vector).all():
+            raise ValueError("Qdrant query contains non-finite values")
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm) or norm <= 0.0:
+            raise ValueError("Qdrant query has zero norm")
+        vector = vector / norm
+        limit = max(1, int(top_k))
+        self._check_collection()
+        request = dict(
+            query=vector.tolist(),
+            limit=limit,
+            with_payload=True,
+            with_vector=False,
+            params=(
+                {"exact": True}
+                if self.exact
+                else {"hnsw_ef": self.hnsw_ef}
+            ),
+        )
+        if self._using is not None:
+            request["using"] = self._using
+        encoded = urllib.parse.quote(self.collection, safe="")
+        response = self._request(
+            "POST", "/collections/%s/points/query" % encoded, request
+        )
+        result = response.get("result", {})
+        points = result.get("points", []) if isinstance(result, dict) else []
+        scores = []
+        keys = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            key = self._frame_key(point.get("payload") or {})
+            if not key:
+                continue
+            keys.append(key)
+            scores.append(float(point.get("score", 0.0)))
+        return (
+            np.asarray([scores], dtype=np.float32),
+            np.asarray([keys], dtype=object),
+        )
+
+
+__all__ = ["QdrantVisualIndex"]

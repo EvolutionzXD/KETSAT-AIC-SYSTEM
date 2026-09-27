@@ -1,0 +1,363 @@
+:root {
+  --frame-strip-height: clamp(145px, 20vh, 220px);
+}
+
+/* Responsive video viewer. This file intentionally loads after the legacy
+   show_video.css, whose old fixed 950x490 layout is unsuitable for laptops. */
+.Details {
+  top: 50% !important;
+  left: 50% !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: translate(-50%, -50%) !important;
+  /* Keep the video viewer above result-card controls such as the
+     multi-video selection button. The legacy stylesheet used z-index: 1. */
+  z-index: 3000;
+  width: min(1300px, 95vw) !important;
+  height: min(85vh, 850px) !important;
+  max-height: 95vh !important;
+  align-items: stretch;
+  justify-content: stretch;
+  
+  /* Cho phép nội dung bị kéo ra ngoài không bị cắt mất (override show_video.css) */
+  overflow: visible !important;
+  /* Bỏ chặn click cho phần trong suốt của container */
+  pointer-events: none;
+}
+
+.Details .details_bg {
+  position: relative;
+  /* Kích hoạt lại click cho phần background video */
+  pointer-events: auto;
+  inset: auto;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(260px, 28vw, 340px);
+  align-items: stretch;
+  padding-top: 30px;
+  box-sizing: border-box;
+}
+
+.video-player-container {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 8px 10px 52px;
+  box-sizing: border-box;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.Details .details_bg .vid_details {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-height: 100%;
+  max-width: 100%;
+  margin: 0;
+  box-sizing: border-box;
+  display: block;
+  object-fit: contain;
+  background: #000;
+}
+
+.Details .details_bg .custom-controls {
+  bottom: 10px;
+  z-index: 2;
+}
+
+.Details .details_bg .close {
+  z-index: 5;
+  width: 34px;
+  height: 28px;
+  padding: 0;
+}
+
+.video-tools-panel {
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-3);
+  border-left: 1px solid var(--border-color);
+}
+
+.tools-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.tool-tab-btn {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 6px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-md);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.tool-tab-btn.active {
+  color: var(--primary-color);
+  border-bottom-color: var(--primary-color);
+}
+
+.tool-tab-content {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+.tool-tab-content.active {
+  display: flex;
+  flex-direction: column;
+}
+
+.asr-container {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+  background-color: var(--bg-surface-2);
+  border-radius: 8px;
+}
+
+.asr-segment {
+  display: flex;
+  gap: 12px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background-color: var(--bg-surface-1);
+  border: 1px solid var(--border-color);
+}
+
+.asr-segment:hover {
+  background-color: var(--bg-surface-hover);
+  border-color: var(--primary-color);
+}
+
+.asr-segment.active {
+  background-color: var(--primary-color-light, rgba(0, 123, 255, 0.15));
+  border-color: var(--primary-color);
+  font-weight: bold;
+}
+
+.asr-time {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.asr-segment.active .asr-time {
+  color: var(--primary-color);
+  font-weight: bold;
+}
+
+.asr-text {
+  flex: 1;
+  font-size: 0.95em;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+/* Bottom frame picker: thumbnails scroll, controls remain visible. */
+.video-frames {
+  height: var(--frame-strip-height);
+  min-height: 145px;
+  max-height: 220px;
+  justify-content: flex-start;
+  align-items: stretch;
+  padding: 8px 44px 8px 8px;
+  box-sizing: border-box;
+}
+
+.frames-container {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 4px 0 10px;
+  scroll-snap-type: x proximity;
+}
+
+.frame-container {
+  flex: 0 0 auto;
+  scroll-snap-align: start;
+}
+
+.video-frame {
+  width: clamp(120px, 13vw, 185px);
+  height: calc(var(--frame-strip-height) - 54px);
+  max-height: 155px;
+  object-fit: contain;
+  background: #000;
+}
+
+.navigation-buttons {
+  flex: 0 0 150px;
+  align-self: center;
+  margin: 0 0 0 8px;
+}
+
+.video-frames .close-button {
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  z-index: 2;
+}
+
+body.frame-strip-open .left-panel,
+body.frame-strip-open .right-panel {
+  height: calc(100vh - 55px - var(--frame-strip-height));
+}
+
+/* Keep the CSV/export drawer usable on narrower displays. */
+.export-area.show {
+  flex: 0 0 clamp(220px, 20vw, 320px);
+  width: clamp(220px, 20vw, 320px);
+  min-width: 220px;
+}
+
+.export-area.show .export-header {
+  height: auto;
+  min-height: 36px;
+  flex-wrap: wrap;
+}
+
+.export-area.show .export-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+@media (max-width: 900px) {
+  .Details {
+    inset: calc(56px + 1.5cm) 8px auto 8px;
+    width: calc(100vw - 16px);
+    height: calc(100vh - 70px - 1.5cm);
+    max-height: none;
+  }
+
+  .Details .details_bg {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(260px, 1fr) minmax(180px, 34vh);
+  }
+
+  .video-player-container {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .video-tools-panel {
+    border-left: 0;
+  }
+
+  .export-area.show {
+    flex-basis: 240px;
+    width: 240px;
+  }
+}
+
+@media (max-height: 700px) {
+  :root {
+    --frame-strip-height: 145px;
+  }
+
+  .Details {
+    height: calc(100vh - 72px - 1.5cm);
+  }
+}
+
+/* Direct Video Service tab in the left panel. */
+.task-name-main #video-service-tab {
+  gap: 4px;
+}
+
+.video-service-panel {
+  margin: 0 10px 12px;
+  padding: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-2);
+}
+
+.video-service-panel[hidden] {
+  display: none;
+}
+
+.video-service-panel h3 {
+  margin: 0 0 14px;
+  color: var(--text-hi);
+  font-size: 15px;
+}
+
+.video-service-panel label {
+  display: block;
+  margin: 9px 0 5px;
+  color: var(--text-md);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.video-service-panel input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-1);
+  color: var(--text-hi);
+  font-family: 'JetBrains Mono', monospace;
+  color-scheme: dark;
+}
+
+#video-service-open {
+  width: 100%;
+  margin-top: 14px;
+  padding: 10px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--primary-color);
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#video-service-open:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.video-service-hint {
+  margin: 10px 0 0;
+  color: var(--text-lo);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.video-service-error {
+  min-height: 16px;
+  margin-top: 8px;
+  color: #ef5350;
+  font-size: 12px;
+}

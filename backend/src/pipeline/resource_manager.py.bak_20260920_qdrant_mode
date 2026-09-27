@@ -1,0 +1,1615 @@
+"""
+Resource Manager ??? singleton loader for FAISS indexes, metadata, and visual features.
+All resources are loaded ONCE at startup and cached for the lifetime of the process.
+This eliminates per-query disk I/O which was the #1 performance killer in the baseline.
+"""
+import json
+import math
+import os
+import threading
+from pathlib import Path
+from typing import Dict, List, Mapping, Optional, Tuple
+
+import faiss
+import numpy as np
+import torch
+from loguru import logger
+from transformers import AutoTokenizer, AutoModel
+
+from src.config import get_settings
+from src.search.qdrant_visual import QdrantVisualIndex
+
+#: Fallback when a video has no FPS metadata. Frame/time conversions using
+#: this value are unreliable for videos recorded at another rate.
+DEFAULT_FPS = 25.0
+
+
+class ResourceManager:
+    """
+    Centralized resource loader with lazy initialization and thread-safe access.
+
+    Loads on first access, then holds references for the entire process lifetime.
+    This is critical for performance: avoids re-reading FAISS indexes and metadata
+    on every single query.
+    """
+
+    _instance: Optional["ResourceManager"] = None
+    _lock = threading.Lock()
+
+    def __new__(cls) -> "ResourceManager":
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._settings = get_settings()
+        self._device = torch.device(
+            "cuda" if self._settings.device == "cuda" and torch.cuda.is_available() else "cpu"
+        )
+        self._pe_core_device = self._configured_device(
+            self._settings.pe_core_device, self._device
+        )
+        self._siglip2_device = self._configured_device(
+            self._settings.siglip2_device, self._device
+        )
+        default_beit3_device = self._device
+        if self._device.type == "cuda" and torch.cuda.device_count() >= 2:
+            default_beit3_device = torch.device("cuda:1")
+        self._beit3_device = self._configured_device(
+            self._settings.beit3_device, default_beit3_device
+        )
+        self._jina_v5_device = self._configured_device(
+            getattr(self._settings, "jina_v5_device", None), self._device
+        )
+        logger.info(
+            "Encoder devices: PE-Core={}, SigLIP2={}, BEiT-3={}, Jina-v5={}",
+            self._pe_core_device,
+            self._siglip2_device,
+            self._beit3_device,
+            self._jina_v5_device,
+        )
+
+        # Core resources (lazy loaded)
+        self._audio_index: Optional[faiss.Index] = None
+        self._visual_index: Optional[faiss.Index] = None
+        self._audio_metadata: Optional[Dict] = None
+        self._frame_ids: Optional[List] = None
+        self._frame_mapping: Optional[Dict] = None
+        self._video_metadata: Optional[Dict] = None
+        self._catalog = None
+        self._catalog_checked = False
+        self._catalog_index_records: Dict[str, Optional[Mapping[str, object]]] = {}
+        self._catalog_frame_mapping: Dict[str, Dict[str, object]] = {}
+        self._catalog_video_fps: Dict[str, float] = {}
+        self._verified_catalog_artifacts: set = set()
+
+        self._ocr_results: Optional[Dict] = None
+        self._ocr_frame_map = None
+        self._ocr_semantic_index: Optional[faiss.Index] = None
+        self._ocr_semantic_metadata: Optional[List[Dict]] = None
+        self._ocr_semantic_load_attempted = False
+        self._caption_results: Optional[Dict] = None
+        self._qwen_structured_indexes = None
+        self._scene_graph: Optional[Dict] = None
+        self._visual_features: Optional[Dict[str, Tuple[np.ndarray, List[int]]]] = None
+        self._asr_bge_index: Optional[faiss.Index] = None
+        self._asr_bge_segments: Optional[List[Dict]] = None
+        self._asr_bge_fine_index: Optional[faiss.Index] = None
+        self._asr_bge_fine_segments: Optional[List[Dict]] = None
+
+        # Models (lazy loaded)
+        self._pe_core_encoder = None
+        self._text_embed_model: Optional[AutoModel] = None
+        self._text_embed_tokenizer: Optional[AutoTokenizer] = None
+        self._beit3_encoder = None
+        self._bge_m3_encoder = None
+        self._pe_core_frame_row_lookup: Optional[Dict[str, int]] = None
+        self._beit3_frame_row_lookup: Optional[Dict[str, int]] = None
+
+        # Second granularity for the ensemble (Algorithm 3): BEiT-3 index +
+        # its own frame_ids.json, self-contained per scripts/build_index.py.
+        self._beit3_visual_index: Optional[faiss.Index] = None
+        self._beit3_frame_ids: Optional[List[str]] = None
+
+        # Third granularity: SigLIP2
+        self._siglip2_encoder = None
+        self._siglip2_visual_index: Optional[faiss.Index] = None
+        self._siglip2_frame_ids: Optional[List[str]] = None
+        # Optional Jina v5 Omni visual lane.  Its packed artifact uses the
+        # explicit ``reduce.index``/``reduce.frame_ids.json`` convention and
+        # is deliberately kept outside the catalog aliases.
+        self._jina_v5_encoder = None
+        self._jina_v5_visual_index: Optional[faiss.Index] = None
+        self._jina_v5_frame_ids: Optional[List[str]] = None
+        self._jina_v5_frame_row_lookup: Optional[Dict[str, int]] = None
+
+        # Feature matrix for fast visual search
+        self._visual_feature_matrix: Optional[np.ndarray] = None
+        self._visual_feature_video_ids: Optional[List[str]] = None
+        self._visual_feature_frame_ids: Optional[List[int]] = None
+
+        # Resource lock for thread safety during loading
+        self._resource_lock = threading.RLock()
+
+        # Videos already warned about missing FPS metadata (warn once each)
+        self._fps_warned: set = set()
+
+    @staticmethod
+    def _configured_device(configured: Optional[str], fallback: torch.device) -> torch.device:
+        """Resolve and validate an encoder device inside visible CUDA GPUs."""
+        if not configured:
+            return fallback
+        candidate = torch.device(configured)
+        if candidate.type != "cuda":
+            return candidate
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"Configured {configured}, but CUDA is unavailable")
+        index = candidate.index if candidate.index is not None else 0
+        count = torch.cuda.device_count()
+        if index < 0 or index >= count:
+            raise ValueError(
+                f"Configured CUDA device {configured} is outside the "
+                f"CUDA_VISIBLE_DEVICES namespace ({count} visible GPUs)"
+            )
+        return candidate
+
+    # ????????? Device ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    def _resolve_configured_path(
+        self, value: Optional[Path]
+    ) -> Optional[Path]:
+        """Resolve a settings path against the configured data root."""
+        if value is None:
+            return None
+        path = Path(value)
+        resolver = getattr(self._settings, "resolve_path", None)
+        return Path(resolver(path)) if callable(resolver) else path
+
+    def _load_qdrant_visual_index(
+        self, collection: str, dimension: int
+    ) -> QdrantVisualIndex:
+        """Create one lazy read-only Qdrant visual lane."""
+        return QdrantVisualIndex(
+            url=self._settings.qdrant_url,
+            collection=collection,
+            dimension=dimension,
+            timeout_seconds=self._settings.qdrant_timeout_seconds,
+            vendor_path=self._settings.qdrant_client_vendor,
+        )
+
+
+    # ????????? PE-Core encoder ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+    def load_pe_core_encoder(self):
+        """Load the canonical PE-Core visual/text encoder lazily."""
+        if self._pe_core_encoder is None:
+            with self._resource_lock:
+                if self._pe_core_encoder is None:
+                    from src.encoders import PECoreEncoder
+
+                    logger.info(
+                        f"Loading PE-Core encoder: {self._settings.pe_core_model_id}"
+                    )
+                    self._pe_core_encoder = PECoreEncoder(
+                        model_id=self._settings.pe_core_model_id,
+                        device=self._pe_core_device,
+                    )
+        return self._pe_core_encoder
+
+    # ????????? Raw embedding reconstruction (for embedding-based rerank) ??????????????????????????????
+
+    def get_pe_core_vector(self, frame_id_str: str) -> Optional[np.ndarray]:
+        """Fetch one candidate's raw PE-Core vector by its frame_ids.json key.
+
+        Cheap: the visual FAISS index is IndexFlatIP (exact, stores vectors
+        verbatim ??? see scripts/build_index.py), so reconstruct() is a plain
+        row lookup, not a search. Returns None when the index isn't loaded
+        or the frame isn't in it, so callers can fall back gracefully.
+        """
+        index = self.load_visual_index()
+        if index is None:
+            return None
+        if isinstance(index, QdrantVisualIndex):
+            # The Final_AIC Qdrant adapter is intentionally search-only.
+            # Remote vector reconstruction is not required by the normal RRF
+            # path and would add a large, avoidable network round-trip.
+            return None
+        if self._pe_core_frame_row_lookup is None:
+            frame_ids = self.load_frame_ids()
+            self._pe_core_frame_row_lookup = {fid: i for i, fid in enumerate(frame_ids)}
+        row = self._pe_core_frame_row_lookup.get(frame_id_str)
+        if row is None:
+            return None
+        return np.asarray(index.reconstruct(int(row)), dtype=np.float32)
+
+    def get_beit3_vector(self, frame_id_str: str) -> Optional[np.ndarray]:
+        """Fetch one candidate's raw BEiT-3 vector by its frame_ids key.
+
+        Mirrors get_pe_core_vector for the ensemble's second granularity.
+        """
+        loaded = self.load_beit3_visual_index()
+        if loaded is None:
+            return None
+        index, beit3_frame_ids = loaded
+        if isinstance(index, QdrantVisualIndex):
+            return None
+        if self._beit3_frame_row_lookup is None:
+            self._beit3_frame_row_lookup = {
+                fid: i for i, fid in enumerate(beit3_frame_ids)
+            }
+        row = self._beit3_frame_row_lookup.get(frame_id_str)
+        if row is None:
+            return None
+        return np.asarray(index.reconstruct(int(row)), dtype=np.float32)
+
+    # ????????? Text Embedding Model ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+    def load_text_embed_model(self) -> Tuple[AutoModel, AutoTokenizer]:
+        """Load text embedding model and tokenizer lazily."""
+        if self._text_embed_model is None:
+            with self._resource_lock:
+                if self._text_embed_model is None:
+                    logger.info(
+                        f"Loading text embed model: {self._settings.text_embed_model_name}"
+                    )
+                    self._text_embed_model = AutoModel.from_pretrained(
+                        self._settings.text_embed_model_name
+                    ).to(self._device)
+                    self._text_embed_model.eval()
+                    self._text_embed_tokenizer = AutoTokenizer.from_pretrained(
+                        self._settings.text_embed_model_name
+                    )
+                    logger.info(f"Text embed model loaded on {self._device}")
+        return self._text_embed_model, self._text_embed_tokenizer
+
+    # ????????? FAISS Indexes ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+    def load_catalog(self):
+        """Open the deployed catalog once, read-only and immutable.
+
+        A missing catalog means the compatibility JSON deployment is still in
+        use. A catalog that exists but has an invalid schema fails loudly; it
+        is never silently treated as legacy data.
+        """
+
+        if not self._catalog_checked:
+            with self._resource_lock:
+                if not self._catalog_checked:
+                    from src.storage.catalog import Catalog
+
+                    path = self._settings.resolve_path(self._settings.catalog_path)
+                    if not path.is_file():
+                        self._catalog_checked = True
+                        logger.info(
+                            f"SQLite catalog not found at {path}; using compatibility sidecars"
+                        )
+                        return None
+                    if getattr(self._settings, "catalog_require_tmpfs", False):
+                        resolved = path.resolve()
+                        try:
+                            resolved.relative_to(Path("/dev/shm"))
+                        except ValueError as exc:
+                            raise ValueError(
+                                "UIT runtime catalog must be staged under /dev/shm "
+                                "when CATALOG_REQUIRE_TMPFS=true"
+                            ) from exc
+                    catalog = Catalog(path, read_only=True, immutable=True)
+                    try:
+                        catalog.validate_schema()
+                    except Exception:
+                        catalog.close()
+                        raise
+                    self._catalog = catalog
+                    self._catalog_checked = True
+                    logger.info(f"Opened immutable SQLite catalog from {path}")
+        return self._catalog
+
+    def _active_catalog_index(
+        self, alias: str
+    ) -> Optional[Mapping[str, object]]:
+        if alias in self._catalog_index_records:
+            return self._catalog_index_records[alias]
+        catalog = self.load_catalog()
+        record = None if catalog is None else catalog.get_active_frame_index(alias)
+        self._catalog_index_records[alias] = record
+        return record
+
+    def _catalog_visual_mode(self) -> bool:
+        return self._active_catalog_index(self._settings.pe_core_index_alias) is not None
+
+    def _catalog_frame_contract(
+        self, record: Mapping[str, object]
+    ) -> Tuple[List[str], Dict[str, Dict[str, object]]]:
+        frame_ids: List[str] = []
+        mapping: Dict[str, Dict[str, object]] = {}
+        for row in record["rows"]:
+            frame_uid = str(row["frame_uid"])
+            fps = float(row["fps_num"]) / float(row["fps_den"])
+            metadata = {
+                "video_id": row["video_id"],
+                "frame_number": int(row["original_frame_idx"]),
+                "video_uid": row["video_uid"],
+                "candidate_idx": int(row["candidate_idx"]),
+                "timestamp_us": int(row["timestamp_us"]),
+                "fps": fps,
+            }
+            previous = self._catalog_frame_mapping.get(frame_uid)
+            if previous is not None and previous != metadata:
+                raise ValueError(f"catalog frame_uid {frame_uid} has conflicting metadata")
+            frame_ids.append(frame_uid)
+            mapping[frame_uid] = metadata
+            self._catalog_frame_mapping[frame_uid] = metadata
+            self._catalog_video_fps[str(row["video_id"])] = fps
+        return frame_ids, mapping
+
+    def _load_catalog_faiss_index(
+        self,
+        record: Mapping[str, object],
+        *,
+        expected_modality: str,
+        expected_model_id: str,
+    ) -> faiss.Index:
+        """Validate catalog provenance/checksum and load one immutable FAISS file."""
+
+        from src.data.frame_manifest import sha256_file
+        from src.storage.catalog import resolve_data_root_uri
+
+        if record["backend"] != "faiss":
+            raise ValueError(f"catalog index backend must be faiss, got {record['backend']!r}")
+        if record["modality"] != expected_modality:
+            raise ValueError(
+                f"catalog index modality is {record['modality']!r}, expected "
+                f"{expected_modality!r}"
+            )
+        if record["metric"] != "inner_product" or not record["normalized"]:
+            raise ValueError("visual catalog index must use normalized inner-product vectors")
+        if record["model_id"] != expected_model_id:
+            raise ValueError(
+                f"catalog index was built with model '{record['model_id']}' but "
+                f"runtime expects '{expected_model_id}'"
+            )
+
+        path = resolve_data_root_uri(
+            self._settings.resolve_path(self._settings.data_root),
+            str(record["index_uri"]),
+        )
+        if not path.is_file():
+            raise FileNotFoundError(f"catalog FAISS artifact not found at {path}")
+        if (
+            getattr(self._settings, "catalog_verify_artifact_checksums", True)
+            and path not in self._verified_catalog_artifacts
+        ):
+            actual_checksum = sha256_file(path)
+            if actual_checksum != record["index_sha256"]:
+                raise ValueError(
+                    f"catalog FAISS checksum mismatch for {path}: "
+                    f"expected {record['index_sha256']}, got {actual_checksum}"
+                )
+            self._verified_catalog_artifacts.add(path)
+
+        index = faiss.read_index(str(path))
+        if index.ntotal != int(record["row_count"]):
+            raise ValueError(
+                f"FAISS ntotal={index.ntotal} differs from catalog row_count="
+                f"{record['row_count']}"
+            )
+        if index.d != int(record["dimension"]):
+            raise ValueError(
+                f"FAISS dimension={index.d} differs from catalog dimension="
+                f"{record['dimension']}"
+            )
+        metric_type = getattr(index, "metric_type", None)
+        if metric_type is not None and metric_type != faiss.METRIC_INNER_PRODUCT:
+            raise ValueError("FAISS metric does not match catalog inner_product metadata")
+        return index
+
+    def load_audio_index(self) -> faiss.Index:
+        """Load FAISS audio index lazily."""
+        if self._audio_index is None:
+            with self._resource_lock:
+                if self._audio_index is None:
+                    path = self._settings.audio_faiss_index_path
+                    if not path.exists():
+                        raise FileNotFoundError(
+                            f"Audio FAISS index not found at {path}. "
+                            "Run scripts/build_index.py first."
+                        )
+                    logger.info(f"Loading audio FAISS index from {path}")
+                    self._audio_index = faiss.read_index(str(path))
+                    logger.info(
+                        f"Audio FAISS index loaded: {self._audio_index.ntotal} vectors, "
+                        f"dim={self._audio_index.d}"
+                    )
+        return self._audio_index
+
+    def load_asr_bge_index(self) -> Optional[faiss.Index]:
+        """Load the semantic ASR (BGE-M3, 20s segments) FAISS index lazily.
+
+        Returns None (not raise) when unconfigured or the file is missing ???
+        this is an optional refinement over the coarser one-vector-per-video
+        audio index above, not a required resource.
+        """
+        if self._asr_bge_index is None:
+            with self._resource_lock:
+                if self._asr_bge_index is None:
+                    path = self._settings.asr_bge_index_path
+                    if path is None or not path.exists():
+                        return None
+                    logger.info(f"Loading ASR BGE-M3 FAISS index from {path}")
+                    self._asr_bge_index = faiss.read_index(str(path))
+                    logger.info(
+                        f"ASR BGE-M3 FAISS index loaded: "
+                        f"{self._asr_bge_index.ntotal} segments, dim={self._asr_bge_index.d}"
+                    )
+        return self._asr_bge_index
+
+    def load_asr_bge_segments(self) -> List[Dict]:
+        """Load the row-ordered ASR segment sidecar (video_id/start/end/text)."""
+        if self._asr_bge_segments is None:
+            path = self._settings.asr_bge_segments_path
+            if path is None or not path.exists():
+                self._asr_bge_segments = []
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    self._asr_bge_segments = json.load(f)
+                logger.info(
+                    f"ASR BGE-M3 segments loaded: {len(self._asr_bge_segments)} entries"
+                )
+        return self._asr_bge_segments
+
+    def load_asr_bge_fine_index(self) -> Optional[faiss.Index]:
+        """Load the optional sentence-level BGE-M3 ASR index."""
+        if self._asr_bge_fine_index is None:
+            with self._resource_lock:
+                if self._asr_bge_fine_index is None:
+                    path = getattr(self._settings, "asr_bge_fine_index_path", None)
+                    if path is None or not path.exists():
+                        return None
+                    logger.info(f"Loading fine ASR BGE-M3 FAISS index from {path}")
+                    self._asr_bge_fine_index = faiss.read_index(str(path))
+                    logger.info(
+                        "Fine ASR BGE-M3 FAISS index loaded: "
+                        f"{self._asr_bge_fine_index.ntotal} segments, "
+                        f"dim={self._asr_bge_fine_index.d}"
+                    )
+        return self._asr_bge_fine_index
+
+    def load_asr_bge_fine_segments(self) -> List[Dict]:
+        """Load the optional sentence-level ASR sidecar."""
+        if self._asr_bge_fine_segments is None:
+            path = getattr(self._settings, "asr_bge_fine_segments_path", None)
+            if path is None or not path.exists():
+                self._asr_bge_fine_segments = []
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    value = json.load(f)
+                self._asr_bge_fine_segments = value if isinstance(value, list) else []
+                logger.info(
+                    "Fine ASR BGE-M3 segments loaded: "
+                    f"{len(self._asr_bge_fine_segments)} entries"
+                )
+        return self._asr_bge_fine_segments
+
+    def load_bge_m3_encoder(self):
+        """Load the BGE-M3 text encoder lazily, for query-side ASR search.
+
+        Raises on failure (matches load_jina_reranker's precedent removed
+        2026-08-09 ??? see aic2026-search-algo-tuning memory): this is an
+        optional signal, so callers must catch and disable it for the
+        request rather than letting the whole search dependency chain fail.
+        """
+        if self._bge_m3_encoder is None:
+            with self._resource_lock:
+                if self._bge_m3_encoder is None:
+                    from FlagEmbedding import BGEM3FlagModel
+
+                    model_name = self._settings.asr_bge_model_name
+                    device = self._settings.asr_bge_device
+                    use_fp16 = self._settings.asr_bge_use_fp16
+                    logger.info(
+                        f"Loading BGE-M3 encoder: {model_name} "
+                        f"(device={device}, fp16={use_fp16})"
+                    )
+                    self._bge_m3_encoder = BGEM3FlagModel(
+                        model_name,
+                        use_fp16=use_fp16,
+                        devices=device,
+                    )
+                    logger.info(f"BGE-M3 encoder loaded on {device}")
+        return self._bge_m3_encoder
+
+    def load_visual_index(self) -> faiss.Index:
+        """Load FAISS visual index lazily."""
+        if getattr(self._settings, "visual_index_backend", "faiss") == "qdrant":
+            if self._visual_index is None:
+                self._visual_index = self._load_qdrant_visual_index(
+                    self._settings.qdrant_pe_core_collection, 1024
+                )
+                logger.info(
+                    "PE-Core visual lane configured for Qdrant collection %s",
+                    self._settings.qdrant_pe_core_collection,
+                )
+            return self._visual_index
+        if self._visual_index is None:
+            with self._resource_lock:
+                if self._visual_index is None:
+                    record = self._active_catalog_index(
+                        self._settings.pe_core_index_alias
+                    )
+                    if record is not None:
+                        self._visual_index = self._load_catalog_faiss_index(
+                            record,
+                            expected_modality="visual_pe_core",
+                            expected_model_id=self._settings.pe_core_model_id,
+                        )
+                        self._frame_ids, _ = self._catalog_frame_contract(record)
+                        logger.info(
+                            "PE-Core FAISS index loaded from catalog alias %s: %d vectors",
+                            self._settings.pe_core_index_alias,
+                            self._visual_index.ntotal,
+                        )
+                    else:
+                        path = self._settings.visual_faiss_index_path
+                        if not path.exists():
+                            logger.warning(
+                                f"Visual FAISS index not found at {path}. "
+                                "Will use per-video feature search instead."
+                            )
+                            self._visual_index = None
+                        else:
+                            logger.info(f"Loading visual FAISS index from {path}")
+                            visual_index = faiss.read_index(str(path))
+                            self._check_visual_index_metadata(
+                                path.parent,
+                                visual_index.d,
+                                expected_checkpoint=self._settings.pe_core_model_id,
+                                expected_encoder_type="pe_core",
+                            )
+                            self._visual_index = visual_index
+                            logger.info(
+                                f"PE-Core FAISS index loaded: {visual_index.ntotal} vectors"
+                            )
+        return self._visual_index
+
+    def load_beit3_visual_index(self) -> Optional[Tuple[faiss.Index, List[str]]]:
+        """Load the BEiT-3 visual index and its frame IDs when configured.
+
+        Returning ``None`` makes the main visual path fall back to PE-Core.
+        """
+        if self._beit3_visual_index is not None:
+            return self._beit3_visual_index, self._beit3_frame_ids
+        if getattr(self._settings, "visual_index_backend", "faiss") == "qdrant":
+            with self._resource_lock:
+                if self._beit3_visual_index is None:
+                    self._beit3_visual_index = self._load_qdrant_visual_index(
+                        self._settings.qdrant_beit3_collection, 1024
+                    )
+                    self._beit3_frame_ids = []
+            return self._beit3_visual_index, self._beit3_frame_ids
+        pe_core_record = self._active_catalog_index(
+            self._settings.pe_core_index_alias
+        )
+        if pe_core_record is not None:
+            beit3_record = self._active_catalog_index(
+                self._settings.beit3_index_alias
+            )
+            if beit3_record is None:
+                logger.warning(
+                    "Catalog visual mode is active but alias %s is absent; "
+                    "ensemble will use PE-Core only",
+                    self._settings.beit3_index_alias,
+                )
+                return None
+            with self._resource_lock:
+                if self._beit3_visual_index is None:
+                    from src.encoders.beit3_encoder import BEiT3Encoder
+
+                    if (
+                        not self._settings.beit3_checkpoint
+                        or not self._settings.beit3_lora_checkpoint
+                    ):
+                        raise ValueError(
+                            "BEIT3_CHECKPOINT and BEIT3_LORA_CHECKPOINT must be "
+                            "configured before loading the ERM-LoRA index"
+                        )
+                    expected_checkpoint = BEiT3Encoder.checkpoint_identity(
+                        model_name=self._settings.beit3_model_name,
+                        checkpoint_path=self._settings.beit3_checkpoint,
+                        lora_checkpoint_path=self._settings.beit3_lora_checkpoint,
+                        lora_strength=self._settings.beit3_lora_strength,
+                    )
+                    self._beit3_visual_index = self._load_catalog_faiss_index(
+                        beit3_record,
+                        expected_modality="visual_beit3",
+                        expected_model_id=expected_checkpoint,
+                    )
+                    self._beit3_frame_ids, _ = self._catalog_frame_contract(
+                        beit3_record
+                    )
+                    logger.info(
+                        "BEiT-3 FAISS index loaded from catalog alias %s: %d vectors",
+                        self._settings.beit3_index_alias,
+                        self._beit3_visual_index.ntotal,
+                    )
+            return self._beit3_visual_index, self._beit3_frame_ids
+        index_dir = self._settings.beit3_visual_index_dir
+        if index_dir is None:
+            return None
+        with self._resource_lock:
+            if self._beit3_visual_index is None:
+                index_path = Path(index_dir) / "visual_index.faiss"
+                ids_path = Path(index_dir) / "frame_ids.json"
+                if not index_path.exists() or not ids_path.exists():
+                    logger.warning(
+                        f"BEiT-3 index/frame_ids not found under {index_dir}; "
+                        "ensemble will fall back to PE-Core-only."
+                    )
+                    return None
+                logger.info(f"Loading BEiT-3 visual index from {index_path}")
+                beit3_index = faiss.read_index(str(index_path))
+                with open(ids_path, "r", encoding="utf-8") as f:
+                    beit3_frame_ids = json.load(f)
+                from src.encoders.beit3_encoder import BEiT3Encoder
+
+                if (
+                    not self._settings.beit3_checkpoint
+                    or not self._settings.beit3_lora_checkpoint
+                ):
+                    raise ValueError(
+                        "BEIT3_CHECKPOINT and BEIT3_LORA_CHECKPOINT must be "
+                        "configured before loading the ERM-LoRA index"
+                    )
+                expected_checkpoint = BEiT3Encoder.checkpoint_identity(
+                    model_name=self._settings.beit3_model_name,
+                    checkpoint_path=self._settings.beit3_checkpoint,
+                    lora_checkpoint_path=self._settings.beit3_lora_checkpoint,
+                    lora_strength=self._settings.beit3_lora_strength,
+                )
+                self._check_visual_index_metadata(
+                    index_dir,
+                    beit3_index.d,
+                    expected_checkpoint=expected_checkpoint,
+                    expected_encoder_type="beit3",
+                )
+                self._beit3_visual_index = beit3_index
+                self._beit3_frame_ids = beit3_frame_ids
+        return self._beit3_visual_index, self._beit3_frame_ids
+
+    def load_beit3_encoder(self):
+        """Load the BEiT-3 encoder lazily, for query-side text embedding."""
+        if self._beit3_encoder is None:
+            with self._resource_lock:
+                if self._beit3_encoder is None:
+                    from src.encoders import BEiT3Encoder
+
+                    checkpoint = self._settings.beit3_checkpoint
+                    spm_path = self._settings.beit3_spm_path
+                    lora_checkpoint = self._settings.beit3_lora_checkpoint
+                    if not checkpoint or not spm_path or not lora_checkpoint:
+                        raise ValueError(
+                            "BEIT3_CHECKPOINT, BEIT3_SPM_PATH and "
+                            "BEIT3_LORA_CHECKPOINT must all be set to use "
+                            "the research ERM-LoRA encoder"
+                        )
+                    logger.info(f"Loading BEiT-3 encoder: {checkpoint}")
+                    self._beit3_encoder = BEiT3Encoder(
+                        checkpoint_path=checkpoint,
+                        spm_path=spm_path,
+                        model_name=self._settings.beit3_model_name,
+                        lora_checkpoint_path=lora_checkpoint,
+                        lora_strength=self._settings.beit3_lora_strength,
+                        require_lora=True,
+                        device=self._beit3_device,
+                    )
+        return self._beit3_encoder
+
+    def load_siglip2_encoder(self):
+        """Load the SigLIP2 visual/text encoder lazily."""
+        if self._siglip2_encoder is None:
+            with self._resource_lock:
+                if self._siglip2_encoder is None:
+                    from src.encoders import SigLIP2Encoder
+
+                    logger.info(
+                        f"Loading SigLIP2 encoder: {self._settings.siglip2_model_id} "
+                        f"(pretrained={self._settings.siglip2_pretrained})"
+                    )
+                    self._siglip2_encoder = SigLIP2Encoder(
+                        model_id=self._settings.siglip2_model_id,
+                        pretrained=self._settings.siglip2_pretrained,
+                        device=self._siglip2_device,
+                    )
+        return self._siglip2_encoder
+
+    def load_siglip2_visual_index(self) -> Optional[Tuple[faiss.Index, List[str]]]:
+        """Load the SigLIP2 visual index and its frame IDs when configured."""
+        if self._siglip2_visual_index is not None:
+            return self._siglip2_visual_index, self._siglip2_frame_ids
+        if getattr(self._settings, "visual_index_backend", "faiss") == "qdrant":
+            with self._resource_lock:
+                if self._siglip2_visual_index is None:
+                    self._siglip2_visual_index = self._load_qdrant_visual_index(
+                        self._settings.qdrant_siglip2_collection, 1152
+                    )
+                    self._siglip2_frame_ids = []
+            return self._siglip2_visual_index, self._siglip2_frame_ids
+        pe_core_record = self._active_catalog_index(
+            self._settings.pe_core_index_alias
+        )
+        if pe_core_record is not None:
+            siglip2_record = self._active_catalog_index(
+                self._settings.siglip2_index_alias
+            )
+            if siglip2_record is None:
+                logger.warning(
+                    "Catalog visual mode is active but alias %s is absent; ensemble will run without SigLIP2",
+                    self._settings.siglip2_index_alias,
+                )
+                return None
+            with self._resource_lock:
+                if self._siglip2_visual_index is None:
+                    from src.encoders.siglip2_encoder import SigLIP2Encoder
+
+                    expected_checkpoint = SigLIP2Encoder(
+                        model_id=self._settings.siglip2_model_id,
+                        pretrained=self._settings.siglip2_pretrained,
+                    ).checkpoint
+                    self._siglip2_visual_index = self._load_catalog_faiss_index(
+                        siglip2_record,
+                        expected_modality="visual_siglip2",
+                        expected_model_id=expected_checkpoint,
+                    )
+                    self._siglip2_frame_ids, _ = self._catalog_frame_contract(
+                        siglip2_record
+                    )
+                    logger.info(
+                        "SigLIP2 FAISS index loaded from catalog alias %s: %d vectors",
+                        self._settings.siglip2_index_alias,
+                        self._siglip2_visual_index.ntotal,
+                    )
+            return self._siglip2_visual_index, self._siglip2_frame_ids
+        index_dir = self._settings.siglip2_visual_index_dir
+        if index_dir is None:
+            return None
+        with self._resource_lock:
+            if self._siglip2_visual_index is None:
+                index_path = Path(index_dir) / "visual_index.faiss"
+                ids_path = Path(index_dir) / "frame_ids.json"
+                if not index_path.exists() or not ids_path.exists():
+                    logger.warning(
+                        f"SigLIP2 index/frame_ids not found under {index_dir}; ensemble will run without SigLIP2."
+                    )
+                    return None
+                logger.info(f"Loading SigLIP2 visual index from {index_path}")
+                siglip2_index = faiss.read_index(str(index_path))
+                with open(ids_path, "r", encoding="utf-8") as f:
+                    siglip2_frame_ids = json.load(f)
+                from src.encoders.siglip2_encoder import SigLIP2Encoder
+
+                expected_checkpoint = SigLIP2Encoder(
+                    model_id=self._settings.siglip2_model_id,
+                    pretrained=self._settings.siglip2_pretrained,
+                ).checkpoint
+                self._check_visual_index_metadata(
+                    index_dir,
+                    siglip2_index.d,
+                    expected_checkpoint=expected_checkpoint,
+                    expected_encoder_type="siglip2",
+                )
+                self._siglip2_visual_index = siglip2_index
+                self._siglip2_frame_ids = siglip2_frame_ids
+        return self._siglip2_visual_index, self._siglip2_frame_ids
+
+    def _jina_v5_index_paths(self) -> Tuple[Optional[Path], Optional[Path]]:
+        """Resolve exactly the configured Jina v5 view.
+
+        ``build_jina_faiss.py`` writes ``reduce.index`` and
+        ``reduce.frame_ids.json`` for the common-reduction view.  Explicit
+        paths take precedence; a missing requested view never silently falls
+        back from reduce to full.
+        """
+        index_path = getattr(self._settings, "jina_v5_visual_index_path", None)
+        ids_path = getattr(self._settings, "jina_v5_frame_ids_path", None)
+        index_dir = getattr(self._settings, "jina_v5_visual_index_dir", None)
+        view = getattr(self._settings, "jina_v5_visual_view", "reduce")
+
+        if index_path is not None:
+            index_path = self._settings.resolve_path(Path(index_path))
+            if ids_path is None:
+                ids_path = index_path.with_name(
+                    index_path.stem + ".frame_ids.json"
+                )
+        elif index_dir is not None:
+            index_dir = self._settings.resolve_path(Path(index_dir))
+            candidates = (
+                (index_dir / f"{view}.index", index_dir / f"{view}.frame_ids.json"),
+                (index_dir / f"{view}.faiss", index_dir / f"{view}.frame_ids.json"),
+            )
+            for candidate_index, candidate_ids in candidates:
+                if candidate_index.is_file() and candidate_ids.is_file():
+                    index_path, ids_path = candidate_index, candidate_ids
+                    break
+        if ids_path is not None:
+            ids_path = self._settings.resolve_path(Path(ids_path))
+        return index_path, ids_path
+
+    def load_jina_v5_visual_index(
+        self,
+    ) -> Optional[Tuple[faiss.Index, List[str]]]:
+        """Load the optional Jina v5 visual index and its row sidecar.
+
+        The Jina builder emits a small ``*.meta.json`` provenance file rather
+        than the catalog's ``index_metadata.json``.  Validate the row count,
+        dimension and IP metric here so a stale/full sidecar cannot corrupt
+        fusion.  A missing optional artifact disables only this lane.
+        """
+        if self._jina_v5_visual_index is not None:
+            return self._jina_v5_visual_index, self._jina_v5_frame_ids
+        if (
+            getattr(self._settings, "visual_index_backend", "faiss") == "qdrant"
+            and getattr(self._settings, "jina_v5_enabled", False)
+        ):
+            with self._resource_lock:
+                if self._jina_v5_visual_index is None:
+                    self._jina_v5_visual_index = self._load_qdrant_visual_index(
+                        self._settings.qdrant_jina_v5_collection, 768
+                    )
+                    self._jina_v5_frame_ids = []
+            return self._jina_v5_visual_index, self._jina_v5_frame_ids
+
+        index_path, ids_path = self._jina_v5_index_paths()
+        if index_path is None or ids_path is None:
+            return None
+        if not index_path.is_file() or not ids_path.is_file():
+            logger.warning(
+                "Jina v5 index/frame_ids not found: %s / %s; lane disabled",
+                index_path,
+                ids_path,
+            )
+            return None
+
+        with self._resource_lock:
+            if self._jina_v5_visual_index is not None:
+                return self._jina_v5_visual_index, self._jina_v5_frame_ids
+
+            logger.info("Loading Jina v5 visual index from %s", index_path)
+            jina_index = faiss.read_index(str(index_path))
+            with ids_path.open("r", encoding="utf-8") as handle:
+                jina_frame_ids = json.load(handle)
+            if not isinstance(jina_frame_ids, list) or not jina_frame_ids:
+                raise ValueError("Jina v5 frame sidecar must be a non-empty list")
+            jina_frame_ids = [str(value) for value in jina_frame_ids]
+            if int(jina_index.ntotal) != len(jina_frame_ids):
+                raise ValueError(
+                    "Jina v5 index/frame sidecar mismatch: "
+                    f"{jina_index.ntotal} != {len(jina_frame_ids)}"
+                )
+            metric_type = getattr(jina_index, "metric_type", None)
+            if metric_type is not None and metric_type != faiss.METRIC_INNER_PRODUCT:
+                raise ValueError(
+                    "Jina v5 index must use inner-product metric; "
+                    f"got {metric_type}"
+                )
+
+            # For reduce.index this resolves to reduce.meta.json.  Validate
+            # when present, but keep the row contract sufficient for older
+            # converted artifacts that have no metadata file.
+            meta_path = index_path.with_suffix(".meta.json")
+            if meta_path.is_file():
+                try:
+                    with meta_path.open("r", encoding="utf-8") as meta_file:
+                        metadata = json.load(meta_file)
+                    meta_dim = metadata.get("dimension")
+                    if meta_dim is not None and int(meta_dim) != int(jina_index.d):
+                        raise ValueError(
+                            "Jina v5 metadata/index dimension mismatch: "
+                            f"{meta_dim} != {jina_index.d}"
+                        )
+                    metric = str(metadata.get("metric", "IP")).upper()
+                    if metric not in {"IP", "INNER_PRODUCT"}:
+                        raise ValueError("Jina v5 metadata metric is not IP")
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid Jina v5 metadata: {meta_path}") from exc
+
+            self._jina_v5_visual_index = jina_index
+            self._jina_v5_frame_ids = jina_frame_ids
+            logger.info(
+                "Jina v5 visual index loaded: %d vectors, dim=%d, view=%s",
+                jina_index.ntotal,
+                jina_index.d,
+                getattr(self._settings, "jina_v5_visual_view", "reduce"),
+            )
+        return self._jina_v5_visual_index, self._jina_v5_frame_ids
+
+    def load_jina_v5_encoder(self):
+        """Load the Jina v5 Omni *text* adapter for query embeddings."""
+        if self._jina_v5_encoder is None:
+            with self._resource_lock:
+                if self._jina_v5_encoder is None:
+                    from src.encoders import JinaV5OmniEncoder
+
+                    self._jina_v5_encoder = JinaV5OmniEncoder(
+                        model_id=self._settings.jina_v5_model_id,
+                        device=self._jina_v5_device,
+                        fp16=self._settings.jina_v5_fp16,
+                        truncate_dim=self._settings.jina_v5_truncate_dim,
+                        modality="text",
+                    )
+                    logger.info(
+                        "Jina v5 Omni text encoder configured on %s",
+                        self._jina_v5_device,
+                    )
+        return self._jina_v5_encoder
+
+    def get_jina_v5_vector(self, frame_id_str: str) -> Optional[np.ndarray]:
+        """Fetch one Jina v5 vector by frame-id key for optional reranking."""
+        loaded = self.load_jina_v5_visual_index()
+        if loaded is None:
+            return None
+        index, frame_ids = loaded
+        if isinstance(index, QdrantVisualIndex):
+            return None
+        if self._jina_v5_frame_row_lookup is None:
+            self._jina_v5_frame_row_lookup = {
+                fid: i for i, fid in enumerate(frame_ids)
+            }
+        row = self._jina_v5_frame_row_lookup.get(str(frame_id_str))
+        if row is None:
+            return None
+        return np.asarray(index.reconstruct(int(row)), dtype=np.float32)
+
+    def _check_visual_index_metadata(
+        self,
+        index_dir: Path,
+        index_dim: int,
+        *,
+        expected_checkpoint: Optional[str],
+        expected_encoder_type: str,
+    ) -> None:
+        """Warn loudly if the index was built with a different encoder."""
+        from src.encoders.index_metadata import (
+            check_index_metadata,
+            load_index_metadata,
+        )
+
+        metadata = load_index_metadata(index_dir)
+        if metadata is None:
+            raise ValueError(
+                f"No index_metadata.json in {index_dir}; cannot verify the "
+                "index encoder matches the configured query encoder "
+                f"('{expected_checkpoint}'). Rebuild with "
+                "scripts/build_index.py to record provenance."
+            )
+        problems = check_index_metadata(
+            metadata,
+            index_dim=index_dim,
+            expected_checkpoint=expected_checkpoint,
+            expected_encoder_type=expected_encoder_type,
+        )
+        if problems:
+            raise ValueError("Visual index/encoder mismatch: " + "; ".join(problems))
+
+    # ????????? Metadata ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+    def load_audio_metadata(self) -> Dict:
+        """Load audio/ASR metadata lazily."""
+        if self._audio_metadata is None:
+            with self._resource_lock:
+                if self._audio_metadata is None:
+                    path = self._settings.audio_metadata_path
+                    if not path.exists():
+                        raise FileNotFoundError(
+                            f"Audio metadata not found at {path}. "
+                            "Run extract_audio.py first."
+                        )
+                    logger.info(f"Loading audio metadata from {path}")
+                    with open(path, "r", encoding="utf-8") as f:
+                        self._audio_metadata = json.load(f)
+                    logger.info(
+                        f"Audio metadata loaded: {len(self._audio_metadata)} videos"
+                    )
+        return self._audio_metadata
+
+    def load_frame_ids(self) -> List:
+        """Load frame IDs list lazily."""
+        if self._frame_ids is None:
+            with self._resource_lock:
+                if self._frame_ids is None:
+                    record = self._active_catalog_index(
+                        self._settings.pe_core_index_alias
+                    )
+                    if record is not None:
+                        self._frame_ids, _ = self._catalog_frame_contract(record)
+                        logger.info(
+                            "Frame IDs loaded from SQLite catalog: %d entries",
+                            len(self._frame_ids),
+                        )
+                    else:
+                        path = self._settings.frame_ids_path
+                        if not path.exists():
+                            self._frame_ids = []
+                        else:
+                            with open(path, "r", encoding="utf-8") as f:
+                                self._frame_ids = json.load(f)
+                            logger.info(
+                                f"Frame IDs loaded: {len(self._frame_ids)} entries"
+                            )
+        return self._frame_ids
+
+    def load_frame_mapping(self) -> Dict:
+        """Load frame mapping lazily."""
+        if self._frame_mapping is None:
+            with self._resource_lock:
+                if self._frame_mapping is None:
+                    record = self._active_catalog_index(
+                        self._settings.pe_core_index_alias
+                    )
+                    if record is not None:
+                        self._catalog_frame_contract(record)
+                        beit3_record = self._active_catalog_index(
+                            self._settings.beit3_index_alias
+                        )
+                        if beit3_record is not None:
+                            self._catalog_frame_contract(beit3_record)
+                        self._frame_mapping = dict(self._catalog_frame_mapping)
+                        logger.info(
+                            "Frame mapping loaded from SQLite catalog: %d entries",
+                            len(self._frame_mapping),
+                        )
+                    else:
+                        path = self._settings.frame_mapping_path
+                        if not path.exists():
+                            self._frame_mapping = {}
+                        else:
+                            with open(path, "r", encoding="utf-8") as f:
+                                self._frame_mapping = json.load(f)
+                            logger.info(
+                                f"Frame mapping loaded: {len(self._frame_mapping)} entries"
+                            )
+        return self._frame_mapping
+
+    def load_video_metadata(self) -> Dict:
+        """Load video metadata lazily."""
+        if self._video_metadata is None:
+            with self._resource_lock:
+                if self._video_metadata is None:
+                    path = self._settings.video_metadata_path
+                    if not path.exists():
+                        self._video_metadata = {}
+                    else:
+                        with open(path, "r", encoding="utf-8") as f:
+                            self._video_metadata = json.load(f)
+                        logger.info(
+                            f"Video metadata loaded: {len(self._video_metadata)} videos"
+                        )
+        return self._video_metadata
+
+    def get_video_fps(self, video_id: str) -> float:
+        """Return native FPS from the catalog, then legacy video metadata.
+
+        Falls back to :data:`DEFAULT_FPS` with a one-time warning per video
+        when the metadata is missing or invalid.
+        """
+        catalog_fps = getattr(self, "_catalog_video_fps", {})
+        if video_id not in catalog_fps and hasattr(self, "_settings"):
+            record = self._active_catalog_index(
+                self._settings.pe_core_index_alias
+            )
+            if record is not None:
+                self._catalog_frame_contract(record)
+                catalog_fps = self._catalog_video_fps
+        if video_id in catalog_fps:
+            return catalog_fps[video_id]
+        metadata = self.load_video_metadata()
+        fps = metadata.get(video_id, {}).get("fps")
+        if isinstance(fps, (int, float)) and fps > 0:
+            return float(fps)
+        if video_id not in self._fps_warned:
+            self._fps_warned.add(video_id)
+            logger.warning(
+                f"No FPS metadata for video '{video_id}'; falling back to "
+                f"{DEFAULT_FPS}. Frame/time conversions may be wrong ??? "
+                "rebuild video_metadata.json with scripts/build_frame_mapping.py"
+            )
+        return DEFAULT_FPS
+
+    def get_frame_path(self, video_id: str, frame_id: int):
+        """Resolve batch1 JPEG through its video manifest."""
+        if not hasattr(self, "_frame_manifest_index"):
+            self._frame_manifest_index = None
+        if self._frame_manifest_index is None:
+            configured_root = self._settings.frame_candidates_root
+            root = Path(configured_root) if configured_root else None
+            manifests = root / "manifests" if root is not None else None
+            index = {}
+            if manifests is not None and manifests.exists():
+                for mp in manifests.glob("*.json"):
+                    try:
+                        with open(mp, "r", encoding="utf-8") as f:
+                            d = json.load(f)
+                        vid = d.get("video_id")
+                        rel = d.get("candidate_frame_dir")
+                        if vid and rel:
+                            index[str(vid)] = root / rel
+                    except (OSError, json.JSONDecodeError):
+                        continue
+            self._frame_manifest_index = index
+        frame_dir = self._frame_manifest_index.get(str(video_id))
+        if frame_dir is None:
+            return None
+        path = frame_dir / f"{int(frame_id):08d}.jpg"
+        if path.exists():
+            return path
+        # Retrieval sources such as OCR/ASR may point at an arbitrary source
+        # frame while batch1 JPEGs are sampled on a 5-frame grid. Resolve the
+        # nearest available keyframe for display/reranking; callers retain the
+        # original frame_id for submission.
+        requested = int(frame_id)
+        for distance in range(1, 6):
+            for nearby in (requested - distance, requested + distance):
+                if nearby < 0:
+                    continue
+                candidate = frame_dir / f"{nearby:08d}.jpg"
+                if candidate.exists():
+                    return candidate
+        return None
+
+    def load_ocr_results(self) -> Dict:
+        """Load and validate the representative-level OCR corpus once."""
+        if self._ocr_results is None:
+            path = self._resolve_configured_path(self._settings.ocr_results_path)
+            if path and path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if not isinstance(data, dict):
+                        raise ValueError(
+                            f"OCR results must be a JSON object: {path}"
+                        )
+                    self._ocr_results = data
+                logger.info(f"OCR results loaded: {len(self._ocr_results)} entries")
+            else:
+                self._ocr_results = {}
+                logger.info("No OCR results found ??? OCR search disabled")
+        return self._ocr_results
+
+    def load_ocr_frame_map(self):
+        """Load every configured OCR frame-map shard exactly once.
+
+        A configured-but-missing shard is an installation error. Silently
+        dropping it makes inherited frames disappear while leaving the service
+        looking healthy, so the complete configured set is validated before
+        any shard is parsed.
+        """
+        if getattr(self, "_ocr_frame_map", None) is None:
+            with self._resource_lock:
+                if getattr(self, "_ocr_frame_map", None) is None:
+                    configured = list(
+                        self._settings.ocr_frame_map_paths or []
+                    )
+                    if not configured:
+                        self._ocr_frame_map = False
+                        logger.info(
+                            "OCR frame map not configured -- "
+                            "inherited-frame expansion disabled"
+                        )
+                    else:
+                        paths = [
+                            self._resolve_configured_path(path)
+                            for path in configured
+                        ]
+                        missing = [
+                            str(path)
+                            for path in paths
+                            if path is None or not path.is_file()
+                        ]
+                        if missing:
+                            raise FileNotFoundError(
+                                "Configured OCR frame-map shard(s) missing: "
+                                + ", ".join(missing)
+                            )
+                        from src.search.ocr_frame_map import load_frame_map
+
+                        self._ocr_frame_map = load_frame_map(paths)
+        return self._ocr_frame_map or None
+
+    @staticmethod
+    def _validate_ocr_semantic_metadata(
+        metadata: object, expected_rows: int
+    ) -> List[Dict]:
+        """Validate the row contract shared by the index and sidecar."""
+        if not isinstance(metadata, list):
+            raise ValueError("OCR semantic metadata must be a JSON list")
+        if len(metadata) != int(expected_rows):
+            raise ValueError(
+                "OCR semantic index/metadata row mismatch: "
+                f"{expected_rows} != {len(metadata)}"
+            )
+
+        for row_index, row in enumerate(metadata):
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"OCR semantic metadata row {row_index} is not an object"
+                )
+            try:
+                embedding_row = int(row.get("embedding_row", row_index))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"OCR semantic metadata row {row_index} has an invalid "
+                    "embedding_row"
+                ) from exc
+            if embedding_row != row_index:
+                raise ValueError(
+                    f"OCR semantic metadata row {row_index} is mapped to "
+                    f"embedding row {embedding_row}"
+                )
+
+            evidence_id = row.get("evidence_id") or row.get("dense_text_id")
+            if not isinstance(evidence_id, str) or not evidence_id.strip():
+                raise ValueError(
+                    f"OCR semantic metadata row {row_index} has no evidence_id"
+                )
+            if not isinstance(row.get("text"), str):
+                raise ValueError(
+                    f"OCR semantic metadata row {row_index} has invalid text"
+                )
+            occurrences = row.get("occurrences")
+            if not isinstance(occurrences, list):
+                raise ValueError(
+                    f"OCR semantic metadata row {row_index} has invalid "
+                    "occurrences"
+                )
+            for occurrence_index, occurrence in enumerate(occurrences):
+                if not isinstance(occurrence, dict):
+                    raise ValueError(
+                        f"OCR semantic metadata row {row_index}, occurrence "
+                        f"{occurrence_index} is not an object"
+                    )
+                video_id = occurrence.get("video_id")
+                if not isinstance(video_id, str) or not video_id.strip():
+                    raise ValueError(
+                        f"OCR semantic metadata row {row_index}, occurrence "
+                        f"{occurrence_index} has no video_id"
+                    )
+                frame_value = occurrence.get("frame_id")
+                if isinstance(frame_value, bool):
+                    raise ValueError(
+                        f"OCR semantic metadata row {row_index}, occurrence "
+                        f"{occurrence_index} has an invalid frame_id"
+                    )
+                try:
+                    frame_id = int(frame_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"OCR semantic metadata row {row_index}, occurrence "
+                        f"{occurrence_index} has an invalid frame_id"
+                    ) from exc
+                if frame_id < 0:
+                    raise ValueError(
+                        f"OCR semantic metadata row {row_index}, occurrence "
+                        f"{occurrence_index} has a negative frame_id"
+                    )
+                confidence = occurrence.get("confidence")
+                if confidence is not None:
+                    if isinstance(confidence, bool):
+                        raise ValueError(
+                            f"OCR semantic metadata row {row_index}, occurrence "
+                            f"{occurrence_index} has an invalid confidence"
+                        )
+                    try:
+                        confidence_value = float(confidence)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"OCR semantic metadata row {row_index}, occurrence "
+                            f"{occurrence_index} has an invalid confidence"
+                        ) from exc
+                    if not math.isfinite(confidence_value) or not (
+                        0.0 <= confidence_value <= 1.0
+                    ):
+                        raise ValueError(
+                            f"OCR semantic metadata row {row_index}, occurrence "
+                            f"{occurrence_index} has an invalid confidence"
+                        )
+        return metadata
+
+    def load_ocr_semantic_index(
+        self,
+    ) -> Optional[Tuple[faiss.Index, List[Dict]]]:
+        """Load the row-safe OCR BGE-M3 index and its sidecar."""
+        if self._ocr_semantic_load_attempted:
+            if self._ocr_semantic_index is None:
+                return None
+            return self._ocr_semantic_index, self._ocr_semantic_metadata or []
+
+        with self._resource_lock:
+            if self._ocr_semantic_load_attempted:
+                if self._ocr_semantic_index is None:
+                    return None
+                return (
+                    self._ocr_semantic_index,
+                    self._ocr_semantic_metadata or [],
+                )
+
+            index_value = getattr(
+                self._settings, "ocr_semantic_index_path", None
+            )
+            metadata_value = getattr(
+                self._settings, "ocr_semantic_metadata_path", None
+            )
+            if index_value is None and metadata_value is None:
+                self._ocr_semantic_load_attempted = True
+                logger.info(
+                    "OCR semantic index not configured -- "
+                    "semantic OCR disabled"
+                )
+                return None
+            if index_value is None or metadata_value is None:
+                raise ValueError(
+                    "OCR semantic index and metadata paths must be configured "
+                    "together"
+                )
+
+            index_path = self._resolve_configured_path(index_value)
+            metadata_path = self._resolve_configured_path(metadata_value)
+            missing = [
+                str(path)
+                for path in (index_path, metadata_path)
+                if path is None or not path.is_file()
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    "Configured OCR semantic artifact(s) missing: "
+                    + ", ".join(missing)
+                )
+
+            logger.info(
+                f"Loading OCR semantic FAISS index from {index_path}"
+            )
+            index = faiss.read_index(str(index_path))
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            validated = self._validate_ocr_semantic_metadata(
+                metadata, int(index.ntotal)
+            )
+            self._ocr_semantic_index = index
+            self._ocr_semantic_metadata = validated
+            self._ocr_semantic_load_attempted = True
+            logger.info(
+                "OCR semantic index loaded: "
+                f"{index.ntotal} rows, dim={index.d}, "
+                f"{len(validated)} metadata rows"
+            )
+            return index, validated
+    def load_caption_results(self) -> Dict:
+        """Load Qwen semantic records (KCP-window captions) lazily.
+
+        Records with ``record: null`` (unparseable/unrepairable JSON, ~0.1%
+        of the real corpus) are left in the dict as-is ??? search_caption_records
+        skips them rather than this loader filtering them, so a caller that
+        wants the raw text for auditing still can.
+        """
+        if self._caption_results is None:
+            path_qwen = self._settings.qwen_semantic_records_path
+            if path_qwen and path_qwen.exists():
+                with open(path_qwen, "r", encoding="utf-8") as f:
+                    self._caption_results = json.load(f)
+                logger.info(f"Qwen semantic records loaded: {len(self._caption_results)} entries")
+            else:
+                self._caption_results = {}
+                logger.info("No Qwen semantic records found ??? caption search disabled")
+        return self._caption_results
+
+    def load_qwen_structured_indexes(self) -> Dict:
+        """Load field-aware Qwen FAISS indexes and their row sidecars."""
+        if self._qwen_structured_indexes is None:
+            with self._resource_lock:
+                if self._qwen_structured_indexes is None:
+                    root = self._settings.qwen_structured_index_dir
+                    loaded = {}
+                    if root and Path(root).is_dir():
+                        for field in ("visual_description", "actions", "entities"):
+                            index_path = Path(root) / f"{field}.faiss"
+                            rows_path = Path(root) / f"{field}.json"
+                            if not index_path.exists() or not rows_path.exists():
+                                continue
+                            index = faiss.read_index(str(index_path))
+                            with open(rows_path, "r", encoding="utf-8") as handle:
+                                rows = json.load(handle)
+                            if index.ntotal != len(rows):
+                                raise ValueError(
+                                    f"Qwen {field} index/sidecar mismatch: "
+                                    f"{index.ntotal} vectors vs {len(rows)} rows"
+                                )
+                            loaded[field] = (index, rows)
+                    self._qwen_structured_indexes = loaded
+                    logger.info(
+                        "Qwen structured indexes loaded: {}",
+                        {name: index.ntotal for name, (index, _) in loaded.items()},
+                    )
+        return self._qwen_structured_indexes
+
+    def load_scene_graph(self) -> Dict:
+        """Load scene graph triplets lazily."""
+        if self._scene_graph is None:
+            path = self._settings.scene_graph_path
+            if path and path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    self._scene_graph = json.load(f)
+                logger.info(
+                    f"Scene graph loaded: {len(self._scene_graph)} entries"
+                )
+            else:
+                self._scene_graph = {}
+                logger.info("No scene graph found ??? graph search disabled")
+        return self._scene_graph
+
+    # ????????? Visual Features (per-video .npy files) ???????????????????????????????????????????????????????????????????????????????????????
+
+    def load_visual_features_for_video(
+        self, video_id: str
+    ) -> Tuple[np.ndarray, List[int]]:
+        """
+        Load all .npy visual features for a single video.
+
+        Returns:
+            features: (N, D) numpy array of feature vectors
+            frame_ids: list of frame IDs corresponding to each row
+        """
+        if self._visual_features is None:
+            self._visual_features = {}
+
+        if video_id not in self._visual_features:
+            feat_dir = self._settings.features_dir / video_id
+            features, frame_ids = [], []
+            if feat_dir.exists():
+                for f in sorted(feat_dir.glob("*.npy")):
+                    try:
+                        feat = np.load(f)
+                        if feat.ndim == 1:
+                            feat = feat.reshape(1, -1)
+                        frame_id = int(f.stem)
+                        features.append(feat)
+                        frame_ids.append(frame_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to load {f}: {e}")
+            self._visual_features[video_id] = (
+                np.vstack(features) if features else np.array([]),
+                frame_ids,
+            )
+        return self._visual_features[video_id]
+
+    # ????????? Convenience: Preload All ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+    def preload_all(self) -> None:
+        """Eagerly load all resources at startup. Call once at app start."""
+        logger.info("Preloading all resources...")
+        loaders = [
+            ("catalog", self.load_catalog),
+            ("pe_core_encoder", self.load_pe_core_encoder),
+            ("audio_index", self.load_audio_index),
+            ("visual_index", self.load_visual_index),
+            ("beit3_visual_index", self.load_beit3_visual_index),
+            ("beit3_encoder", self.load_beit3_encoder),
+            ("siglip2_visual_index", self.load_siglip2_visual_index),
+            ("siglip2_encoder", self.load_siglip2_encoder),
+            ("asr_bge_index", self.load_asr_bge_index),
+            ("asr_bge_segments", self.load_asr_bge_segments),
+            ("bge_m3_encoder", self.load_bge_m3_encoder),
+            ("audio_metadata", self.load_audio_metadata),
+            ("frame_ids", self.load_frame_ids),
+            ("frame_mapping", self.load_frame_mapping),
+            ("video_metadata", self.load_video_metadata),
+            ("ocr_results", self.load_ocr_results),
+            ("ocr_frame_map", self.load_ocr_frame_map),
+            ("ocr_semantic_index", self.load_ocr_semantic_index),
+            ("caption_results", self.load_caption_results),
+            ("qwen_structured_indexes", self.load_qwen_structured_indexes),
+            ("scene_graph", self.load_scene_graph),
+        ]
+        if getattr(self._settings, "asr_bge_prefer_fine", False):
+            loaders.extend(
+                [
+                    ("asr_bge_fine_index", self.load_asr_bge_fine_index),
+                    ("asr_bge_fine_segments", self.load_asr_bge_fine_segments),
+                ]
+            )
+        if getattr(self._settings, "jina_v5_enabled", False):
+            loaders.extend(
+                [
+                    ("jina_v5_visual_index", self.load_jina_v5_visual_index),
+                    ("jina_v5_encoder", self.load_jina_v5_encoder),
+                ]
+            )
+        failed = []
+        for name, loader in loaders:
+            try:
+                loader()
+            except Exception as exc:
+                failed.append(name)
+                logger.warning(f"Preload warning ({name}): {exc}")
+
+        if self._settings.preload_visual_features:
+            try:
+                self._preload_all_visual_features()
+            except Exception as exc:
+                failed.append("visual_features")
+                logger.warning(f"Preload warning (visual_features): {exc}")
+
+        if failed:
+            failed_str = ", ".join(failed)
+            logger.warning(f"Preload completed with unavailable resources: {failed_str}")
+        else:
+            logger.info("All resources preloaded successfully")
+
+    def _preload_all_visual_features(self) -> None:
+        """Preload all visual features into memory (requires ~10GB for large datasets)."""
+        features_dir = self._settings.features_dir
+        if not features_dir.exists():
+            return
+        for video_id in os.listdir(features_dir):
+            self.load_visual_features_for_video(video_id)
+        logger.info(f"Preloaded visual features for {len(self._visual_features)} videos")
+
+    # ????????? Health Check ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+    def health_check(self) -> Dict:
+        """Return status of all resources for health endpoint."""
+        return {
+            "device": str(self._device),
+            "catalog_loaded": self._catalog is not None,
+            "catalog_visual_mode": bool(
+                self._catalog_index_records.get(
+                    self._settings.pe_core_index_alias
+                )
+            ),
+            "catalog_immutable": self._catalog is not None,
+            "pe_core_loaded": self._pe_core_encoder is not None,
+            "text_embed_loaded": self._text_embed_model is not None,
+            "audio_index_loaded": self._audio_index is not None,
+            "visual_index_loaded": self._visual_index is not None,
+            "jina_v5_enabled": bool(
+                getattr(self._settings, "jina_v5_enabled", False)
+            ),
+            "jina_v5_index_loaded": self._jina_v5_visual_index is not None,
+            "jina_v5_frame_count": (
+                len(self._jina_v5_frame_ids)
+                if self._jina_v5_frame_ids is not None else 0
+            ),
+            "audio_metadata_loaded": self._audio_metadata is not None,
+            "num_videos_in_metadata": (
+                len(self._audio_metadata) if self._audio_metadata else 0
+            ),
+            "num_frame_ids": len(self._frame_ids) if self._frame_ids else 0,
+            "num_frame_mapping": len(self._frame_mapping) if self._frame_mapping else 0,
+            "ocr_available": bool(self._ocr_results),
+            "ocr_frame_map_available": (
+                self._ocr_frame_map is not None
+                and self._ocr_frame_map is not False
+            ),
+            "ocr_frame_map_entries": (
+                len(self._ocr_frame_map)
+                if self._ocr_frame_map not in (None, False) else 0
+            ),
+            "ocr_semantic_available": self._ocr_semantic_index is not None,
+            "ocr_semantic_vectors": (
+                int(self._ocr_semantic_index.ntotal)
+                if self._ocr_semantic_index is not None else 0
+            ),
+            "caption_available": bool(self._caption_results),
+            "qwen_structured_available": bool(self._qwen_structured_indexes),
+            "scene_graph_available": bool(self._scene_graph),
+        }
+
+
+def get_resource_manager() -> ResourceManager:
+    """Get the singleton ResourceManager instance."""
+    return ResourceManager()

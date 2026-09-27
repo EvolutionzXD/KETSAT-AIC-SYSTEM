@@ -1,0 +1,2419 @@
+"""
+Main search engine — wraps hybrid search and exposes KIS/TRAKE/QA API.
+This replaces AS.py / Search.py with a clean, cached, preloaded implementation.
+"""
+import hashlib
+from bisect import bisect_left
+import math
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import torch
+from loguru import logger
+from src.pipeline.query_cache import get_query_cache
+
+from src.config import get_settings
+from src.pipeline.resource_manager import get_resource_manager
+from src.rerank.deepseek_reranker import DeepSeekReranker
+from src.rerank.deepseek_vision_reranker import DeepSeekVisionReranker
+from src.rerank.qwen_visual_reranker import QwenVisualReranker
+from src.search.hybrid_search import HybridSearchEngine, FusedResult
+
+
+# Cache logic is now handled by QueryCache in src.pipeline.query_cache
+
+
+# ─── Search Engine ──────────────────────────────────────────────────────────
+
+class SearchEngine:
+    """
+    Unified search engine for AIC competition tasks.
+
+    Supports:
+    - KIS: Known-Item Search (text query → keyframe/video)
+    - AVS: Ad-hoc Video Search (general textual query → keyframe/video)
+    - C-KIS: Conversational KIS (dialogue history + query → keyframe/video)
+    - QA: Question Answering (text question → video segment)
+    - Hybrid retrieval: PE-Core/BEiT-3 visual + ASR audio + OCR + caption
+    """
+
+    def __init__(self):
+        self._settings = get_settings()
+        self._rm = get_resource_manager()
+        self._hybrid = HybridSearchEngine()
+        self._deepseek_reranker: Optional[DeepSeekReranker] = None
+        if self._settings.deepseek_rerank_enabled:
+            if self._settings.deepseek_api_key:
+                self._deepseek_reranker = DeepSeekReranker(
+                    self._settings.deepseek_api_key,
+                    model=self._settings.deepseek_rerank_model,
+                    base_url=self._settings.deepseek_rerank_base_url,
+                    max_tokens=self._settings.deepseek_rerank_max_tokens,
+                )
+            else:
+                logger.warning(
+                    "DeepSeek rerank requested but DEEPSEEK_API_KEY is absent; "
+                    "the local ranking fallback remains active"
+                )
+        self._qwen_reranker: Optional[QwenVisualReranker] = None
+        self._deepseek_vision_reranker: Optional[DeepSeekVisionReranker] = None
+        if self._settings.deepseek_vision_enabled and self._settings.deepseek_api_key:
+            self._deepseek_vision_reranker = DeepSeekVisionReranker(
+                self._settings.deepseek_api_key,
+                model=self._settings.deepseek_vision_model,
+                base_url=self._settings.deepseek_vision_base_url,
+                frame_resolver=self._resolve_frame_path,
+                image_size=self._settings.deepseek_vision_image_size,
+                jpeg_quality=self._settings.deepseek_vision_jpeg_quality,
+            )
+        if self._settings.qwen_rerank_enabled:
+            self._qwen_reranker = QwenVisualReranker(
+                self._settings.qwen_rerank_base_url,
+                self._resolve_frame_path,
+                image_size=self._settings.qwen_rerank_image_size,
+            )
+        self._query_count = 0
+        logger.info("SearchEngine initialized")
+
+    def warmup(self) -> None:
+        """Eagerly load every lazy resource (FAISS indexes, PE-Core, BEiT-3,
+        ASR/OCR/caption corpora) so the first real query is fast instead of
+        paying the one-time load cost (measured 60-180s cold) on whichever
+        user happens to search first. Runs a real search through
+        ``self._hybrid`` directly — bypassing ``search_kis``'s query counter
+        and result cache, since this isn't a real user query — so every
+        modality's `load_*` gets exercised the same way a live query would,
+        without hand-listing each loader (and risking drift as the pipeline
+        grows). Failures are logged, not raised: a slow/broken warmup should
+        not block the API from starting — the same lazy-load path just
+        serves the real first query instead.
+        """
+        started = time.time()
+        try:
+            self._hybrid.preload_ocr_index()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"OCR index warmup failed (non-fatal): {exc}")
+        try:
+            # Materialize GPU models one at a time. Their inference calls can
+            # overlap once resident, but concurrent first-load creates a
+            # large transient VRAM spike and can leave optional rankers in a
+            # retry loop after OOM.
+            if self._settings.ensemble_enabled:
+                visual_warmers = (
+                    ("PE-Core", self._hybrid.encode_text_pe_core),
+                    ("BEiT-3", self._hybrid.encode_text_beit3),
+                    ("SigLIP2", self._hybrid.encode_text_siglip2),
+                )
+                for name, encode in visual_warmers:
+                    encode("warmup")
+                    logger.info(f"{name} query encoder warmed")
+            self._hybrid.search(query_text="warmup", top_k=1)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Warmup search failed (non-fatal): {exc}")
+            return
+        logger.info(f"Warmup completed in {time.time() - started:.1f}s")
+
+    # ─── KIS ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _object_value(value: Any, name: str, default: Any = None) -> Any:
+        """Read a field from either a result object or an API-style dict."""
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    def _build_vtg_seed_moments(
+        self, coarse_results: Optional[List[FusedResult]]
+    ) -> List[Dict[str, Any]]:
+        """Convert one coarse retrieval pass into KCP-aligned VTG moments.
+
+        The old Lock-Video path called ``search_moments`` before normal
+        retrieval, which performed a second global search and then returned
+        VTG midpoints as if they were final frames.  This helper reuses the
+        already-computed coarse results and expands each unique KCP event to
+        its temporal bounds.  It is GT-free and therefore safe for production.
+        """
+        if not coarse_results:
+            return []
+        limit = int(getattr(self._settings, "vtg_seed_moment_limit", 30))
+        padding = int(getattr(self._settings, "vtg_seed_window_frames", 300))
+        event_index = None
+        try:
+            event_index = self._hybrid._get_kcp_event_index()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("VTG KCP seed lookup unavailable: {}", exc)
+
+        timeline_cache: Dict[str, List[Any]] = {}
+        moments: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for rank, result in enumerate(coarse_results, start=1):
+            video_id = str(self._object_value(result, "video_id", ""))
+            if not video_id:
+                continue
+            try:
+                frame_id = int(self._object_value(result, "frame_id", 0))
+            except (TypeError, ValueError):
+                continue
+            start_frame = max(0, frame_id - padding)
+            end_frame = frame_id + padding + 1
+            event_id = None
+            if event_index is not None:
+                try:
+                    event_id = event_index.resolve(
+                        video_id,
+                        frame_id,
+                        nearest_tolerance=self._settings.rrf_kcp_nearest_tolerance,
+                    )
+                except Exception:  # noqa: BLE001
+                    event_id = None
+            if event_id is not None:
+                key = (video_id, str(event_id))
+                if key in seen:
+                    continue
+                seen.add(key)
+                events = timeline_cache.setdefault(
+                    video_id, event_index.ordered_events(video_id)
+                )
+                position = next(
+                    (i for i, row in enumerate(events) if row[0] == str(event_id)),
+                    None,
+                )
+                if position is not None:
+                    event_frames = events[position][1]
+                    if event_frames:
+                        start_frame = int(event_frames[0])
+                        if position + 1 < len(events):
+                            end_frame = int(events[position + 1][1][0])
+                        else:
+                            end_frame = int(event_frames[-1]) + max(1, padding)
+            else:
+                # If a stale/missing KCP sidecar cannot resolve this result,
+                # keep a bounded frame window rather than dropping the seed.
+                key = (video_id, f"frame:{frame_id // max(1, padding)}")
+                if key in seen:
+                    continue
+                seen.add(key)
+            if end_frame <= start_frame:
+                end_frame = start_frame + max(1, padding)
+            raw_score = self._object_value(result, "rrf_score", 0.0)
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                score = 0.0
+            # Keep score positive even for a visual-only result whose score
+            # was not materialized by a compatibility test double.
+            score = max(score, 1.0 / (30.0 + rank))
+            moments.append({
+                "video_id": video_id,
+                "start_frame": int(start_frame),
+                "end_frame": int(end_frame),
+                "score": score,
+                "coarse_rank": rank,
+            })
+            if len(moments) >= limit:
+                break
+        return moments
+
+    def _lock_video_vtg_search(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        coarse_results: Optional[List[FusedResult]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Ground coarse KCP moments with VTG for explicit Lock-Video only.
+
+        VTG is a refinement lane, never a replacement for the normal RRF/KCP
+        candidate pool.  This method therefore returns proposals with their
+        original intervals; callers materialize several frame representatives
+        and merge them after coarse retrieval.
+        """
+        if not getattr(self._settings, "vtg_grounding_enabled", False):
+            return []
+        moments = self._build_vtg_seed_moments(coarse_results)
+        if not moments:
+            # Compatibility fallback for direct unit callers that do not pass
+            # a coarse pool.  In the live KIS path this branch is not used.
+            try:
+                moments = self._hybrid.search_moments(
+                    query,
+                    top_k_moments=int(getattr(
+                        self._settings, "vtg_seed_moment_limit", 30
+                    )),
+                    top_k=max(100, top_k),
+                    top_k_videos=20,
+                    top_k_segments_per_video=5,
+                    top_k_frames_per_segment=20,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("VTG coarse moment fallback failed: {}", exc)
+                return []
+        if not moments:
+            return []
+        from src.grounding.vtg_ground_client import VTGGroundClient
+
+        payload = []
+        for moment in moments:
+            try:
+                video_id = str(self._object_value(moment, "video_id", ""))
+                start_frame = int(self._object_value(moment, "start_frame", 0))
+                end_frame = int(self._object_value(moment, "end_frame", 0))
+                score = float(self._object_value(moment, "score", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if video_id and end_frame > start_frame:
+                payload.append({
+                    "video_id": video_id,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "score": score,
+                })
+        if not payload:
+            return []
+        logger.info("VTG lock grounding: moments={} query={!r}", len(payload), query)
+        proposals = VTGGroundClient(
+            self._settings.vtg_ground_service_url,
+            self._settings.vtg_ground_timeout_seconds,
+        ).ground(
+            query,
+            payload,
+            top_k_per_window=int(getattr(
+                self._settings, "vtg_top_k_per_window", 3
+            )),
+            max_windows=int(getattr(self._settings, "vtg_max_windows", 30)),
+            final_top_k=max(1, min(100, max(top_k, 30))),
+        )
+        normalized = []
+        for rank, proposal in enumerate(proposals, start=1):
+            try:
+                video_id = str(proposal["video_id"])
+                start_frame = int(proposal["start_frame"])
+                end_frame = int(proposal["end_frame"])
+                score = float(proposal.get("score", 0.0))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not video_id or end_frame <= start_frame:
+                continue
+            normalized.append({
+                "video_id": video_id,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "score": score,
+                "window_id": str(proposal.get("window_id", "")),
+                "rank": rank,
+            })
+        return normalized
+
+    def _vtg_available_frames(
+        self, video_id: str
+    ) -> List[int]:
+        """Return cached frame ids that can be resolved to local JPEGs.
+
+        KCP event members are the preferred source because they are already in
+        the production frame coordinate system.  The fallback frame mapping
+        keeps the hook usable on installations without the KCP sidecar.
+        """
+        cache = getattr(self, "_vtg_frame_cache", None)
+        if cache is None:
+            cache = {}
+            self._vtg_frame_cache = cache
+        video_id = str(video_id)
+        if video_id in cache:
+            return cache[video_id]
+        frames: List[int] = []
+        try:
+            event_index = self._hybrid._get_kcp_event_index()
+            if event_index is not None:
+                frames = [
+                    int(frame)
+                    for _event_id, event_frames in event_index.ordered_events(video_id)
+                    for frame in event_frames
+                ]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("VTG KCP frame cache unavailable for {}: {}", video_id, exc)
+        if not frames:
+            try:
+                mapping = self._rm.load_frame_mapping()
+                for key, meta in mapping.items():
+                    if str(meta.get("video_id", "")) != video_id:
+                        continue
+                    value = meta.get("frame_number", meta.get("frame_id"))
+                    if value is None:
+                        try:
+                            value = str(key).rsplit("_", 1)[1]
+                        except IndexError:
+                            continue
+                    try:
+                        frames.append(int(value))
+                    except (TypeError, ValueError):
+                        continue
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("VTG frame mapping unavailable for {}: {}", video_id, exc)
+        cache[video_id] = sorted(set(frames))
+        return cache[video_id]
+
+    def _vtg_candidates_from_proposals(
+        self, proposals: List[Dict[str, Any]]
+    ) -> List[FusedResult]:
+        """Materialize several available keyframes from each VTG interval."""
+        if not proposals:
+            return []
+        count = int(getattr(self._settings, "vtg_frames_per_proposal", 5))
+        by_key: Dict[tuple[str, int], FusedResult] = {}
+        for proposal in proposals:
+            video_id = str(proposal.get("video_id", ""))
+            try:
+                start = int(proposal.get("start_frame", 0))
+                end = int(proposal.get("end_frame", 0))
+                score = float(proposal.get("score", 0.0))
+                proposal_rank = int(proposal.get("rank", 0))
+            except (TypeError, ValueError):
+                continue
+            if not video_id or end <= start:
+                continue
+            available = self._vtg_available_frames(video_id)
+            raw_frames = []
+            if count <= 1:
+                raw_frames = [(start + end) // 2]
+            else:
+                raw_frames = [
+                    int(round(start + (end - start) * i / (count - 1)))
+                    for i in range(count)
+                ]
+            snapped: List[int] = []
+            for target in raw_frames:
+                if available:
+                    pos = bisect_left(available, target)
+                    neighbors = []
+                    if pos < len(available):
+                        neighbors.append(available[pos])
+                    if pos:
+                        neighbors.append(available[pos - 1])
+                    in_interval = [
+                        frame for frame in neighbors if start <= frame <= end
+                    ]
+                    choices = in_interval or neighbors
+                    if choices:
+                        target = min(choices, key=lambda frame: (abs(frame - target), frame))
+                if target not in snapped:
+                    snapped.append(int(target))
+            for local_rank, frame_id in enumerate(snapped, start=1):
+                key = (video_id, int(frame_id))
+                candidate_score = score + 1.0 / (10.0 + local_rank)
+                row = FusedResult(
+                    video_id=video_id,
+                    frame_id=int(frame_id),
+                    rrf_score=float(candidate_score),
+                    visual_score=float(score),
+                    fusion_breakdown={
+                        "vtg_candidate": 1.0,
+                        "vtg_grounding_score": float(score),
+                        "vtg_proposal_rank": float(proposal_rank),
+                        "vtg_local_frame_rank": float(local_rank),
+                        "vtg_start_frame": float(start),
+                        "vtg_end_frame": float(end),
+                    },
+                )
+                previous = by_key.get(key)
+                if previous is None or row.rrf_score > previous.rrf_score:
+                    by_key[key] = row
+        rows = sorted(
+            by_key.values(),
+            key=lambda row: (
+                float((row.fusion_breakdown or {}).get(
+                    "vtg_proposal_rank", 1e9
+                )),
+                -float(row.rrf_score),
+                row.video_id,
+                row.frame_id,
+            ),
+        )
+        for rank, row in enumerate(rows, start=1):
+            row.rank = rank
+        return rows[:int(getattr(self._settings, "vtg_candidate_limit", 120))]
+
+    def _merge_vtg_candidates(
+        self,
+        baseline: List[FusedResult],
+        vtg_candidates: List[FusedResult],
+        *,
+        limit: int,
+    ) -> List[FusedResult]:
+        """Merge VTG evidence after a protected baseline head.
+
+        This prevents a noisy VTG model from damaging Standard/Multi-mode and
+        keeps the first ``vtg_merge_protect_top_n`` coarse results intact in
+        the explicit Lock-Video branch.
+        """
+        if not vtg_candidates:
+            return list(baseline[:limit])
+        protect = int(getattr(
+            self._settings, "vtg_merge_protect_top_n", 20
+        ))
+        head = list(baseline[:min(protect, limit)])
+        tail = list(baseline[min(protect, limit):])
+        ordered = [*head, *vtg_candidates, *tail]
+        out: List[FusedResult] = []
+        seen: set[tuple[str, int]] = set()
+        for row in ordered:
+            key = (str(row.video_id), int(row.frame_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+            if len(out) >= limit:
+                break
+        for rank, row in enumerate(out, start=1):
+            row.rank = rank
+        return out
+
+    def search_kis(
+        self,
+        query: str,
+        top_k: int = 10,
+        fusion_weights: Optional[tuple] = None,
+        diversify_for_ui: bool = True,
+        ocr_query: Optional[str] = None,
+        asr_query: Optional[str] = None,
+        deepseek_vision: bool = False,
+        deepseek_rerank: Optional[bool] = None,
+        search_mode: str = "standard",
+        fusion_mode: str = "late",
+        multimodal_mode: str = "none",
+        _rerank_task: str = "kis",
+    ) -> List[Dict[str, Any]]:
+        """
+        Known-Item Search: find keyframes matching a text description.
+
+        Args:
+            query: Natural language query (Vietnamese or English)
+            top_k: Number of results to return
+            fusion_weights: Deprecated raw-score fusion argument. Supplying it
+                fails clearly; equal-ranker RRF is the current baseline.
+            diversify_for_ui: Limit frames per video for browsing. Must be
+                false for evaluation and automatic ranking.
+
+        Returns:
+            List of result dicts with video_id, frame_id, score, text
+        """
+        self._query_count += 1
+        if fusion_weights is not None:
+            raise ValueError(
+                "fusion_weights is no longer supported; the baseline uses "
+                "equal-ranker RRF"
+            )
+        cache = get_query_cache()
+        
+        cache_semantics = {
+            "task": _rerank_task,
+            "fusion": "hybrid_rank_score_consensus_v2",
+            "fusion_mode": fusion_mode,
+            "search_mode": search_mode,
+            "multimodal_mode": multimodal_mode,
+            # Invalidate entries produced before quoted-OCR/direct-ASR
+            # routing was introduced; the same user query now feeds text
+            # lanes differently.
+            "query_routing": "quoted_ocr_v2_multimode_direct_asr_v2",
+            "rrf_k": self._settings.rrf_k,
+            # Keep cached baseline results separate from the opt-in visual
+            # clause-union ablation; otherwise toggling the feature could
+            # silently return a result produced under the other branch.
+            "visual_clause_union": bool(getattr(
+                self._settings, "rrf_visual_clause_union_enabled", False
+            )),
+            "visual_clause_max": int(getattr(
+                self._settings, "rrf_visual_clause_max", 3
+            )),
+            "deepseek_rerank": (self._deepseek_task_enabled(_rerank_task)
+                                 if deepseek_rerank is None else bool(deepseek_rerank)),
+            "deepseek_model": self._settings.deepseek_rerank_model,
+            "qwen_rerank": self._qwen_task_enabled(_rerank_task),
+            "deepseek_vision": bool(deepseek_vision),
+            "deepseek_vision_model": self._settings.deepseek_vision_model,
+            # Version the explicit lock branch so cached midpoint-only VTG
+            # responses from the previous implementation are never reused.
+            "vtg_lock_pipeline": (
+                "kcp_seed_refine_v10"
+                if search_mode == "video_lock" else "disabled"
+            ),
+            "ocr_query": (ocr_query or query).strip(),
+            "asr_query": (asr_query or query).strip(),
+            "diversify_for_ui": diversify_for_ui,
+            "max_per_video": (
+                self._settings.max_results_per_video if diversify_for_ui else None
+            ),
+        }
+        cached_results = cache.get_results(
+            query, top_k=top_k, **cache_semantics
+        )
+        if cached_results:
+            logger.debug(f"Cache HIT for KIS: '{query}'")
+            return cached_results
+
+        start_time = time.time()
+        logger.info(f"KIS query #{self._query_count}: '{query}' (top_k={top_k})")
+
+        try:
+            # Lock-Video+VTG is a refinement branch.  It must not return raw
+            # VTG midpoints before the normal RRF/KCP pool has been built.
+            # Proposals are materialized after coarse retrieval below.
+            vtg_proposals: List[Dict[str, Any]] = []
+            vtg_candidates: List[FusedResult] = []
+            retrieval_top_k = top_k
+            if deepseek_vision:
+                # Keep the exact same coarse candidate depth as the audited
+                # top-100 baseline.  Hybrid multiplies this value by ten for
+                # each branch; raising it to 200 changes KCP/RRF itself before
+                # the protected top-90 can be captured.
+                # Expand the coarse pool for the optional DeepSeek slow path;
+                # the normal fast path remains unchanged. This makes the
+                # first vision pass genuinely see ~350 candidates instead of
+                # merely having a 600-image setting applied to a 100-row pool.
+                retrieval_top_k = max(
+                    retrieval_top_k, self._settings.deepseek_vision_first_pass_limit
+                )
+            # Final-rerank pool sizing must not overwrite the wider optional
+            # DeepSeek coarse pool; DeepSeek owns its explicit first-pass
+            # budget when enabled.
+            if (
+                not deepseek_vision
+                and multimodal_mode == "none"
+                and self._final_task_enabled(_rerank_task)
+            ):
+                retrieval_top_k = max(
+                    top_k, self._settings.final_rerank_pool_size
+                )
+            results = self._hybrid.search(
+                query_text=query,
+                ocr_query=ocr_query,
+                asr_query=asr_query,
+                top_k=retrieval_top_k,
+                fusion_weights=fusion_weights,
+                rrf_k=self._settings.rrf_k,
+                max_per_video=(
+                    self._settings.max_results_per_video
+                    if diversify_for_ui
+                    else None
+                ),
+                # DeepSeek is an explicit slow-path toggle.  Its candidate
+                # builder needs Video-Lock's wider video shortlist; without
+                # this, hard cases such as q23 never reach the visual critic
+                # even though KCP can localize them once the video is locked.
+                force_deep_video_search=bool(deepseek_vision),
+                fusion_mode=fusion_mode,
+                multimodal_mode=multimodal_mode,
+            )
+            logger.info(
+                "DeepSeek candidate trace: retrieval_top_k={} hybrid_results={}",
+                retrieval_top_k, len(results),
+            )
+
+            if search_mode == "video_lock":
+                vtg_proposals = self._lock_video_vtg_search(
+                    query,
+                    top_k,
+                    coarse_results=results,
+                )
+                vtg_candidates = self._vtg_candidates_from_proposals(vtg_proposals)
+                logger.info(
+                    "VTG lock refinement: proposals={} frame_candidates={}",
+                    len(vtg_proposals), len(vtg_candidates),
+                )
+
+            if deepseek_vision and self._deepseek_vision_reranker is not None:
+                results = self._hybrid.build_deepseek_vision_candidates(
+                    query, results,
+                    event_limit=self._settings.deepseek_vision_event_limit,
+                    frames_per_event=self._settings.deepseek_vision_frames_per_event,
+                    pool_limit=self._settings.deepseek_vision_pool_limit,
+                    # Difficult-query slow path: use the full configured
+                    # vision budget in the first pass as well. Normal queries
+                    # do not enable DeepSeek, so this cost is conditional.
+                    output_limit=self._settings.deepseek_vision_first_pass_limit,
+                )
+                logger.info(
+                    "DeepSeek candidate trace: after_builder={}", len(results)
+                )
+            if vtg_candidates:
+                results = self._merge_vtg_candidates(
+                    results,
+                    vtg_candidates,
+                    limit=max(
+                        retrieval_top_k,
+                        int(getattr(
+                            self._settings, "deepseek_vision_first_pass_limit", 350
+                        )),
+                    ),
+                )
+            output = self._format_results(results, query)
+            if deepseek_vision:
+                if self._deepseek_vision_reranker is None:
+                    logger.warning("DeepSeek Vision requested but unavailable; using retrieval ranking")
+                else:
+                    vision_outcome = self._deepseek_vision_reranker.rerank(
+                        query, output,
+                        candidate_limit=self._settings.deepseek_vision_first_pass_limit,
+                        timeout=self._settings.deepseek_vision_timeout_seconds,
+                    )
+                    logger.info(
+                        "DeepSeek Vision {} in {:.1f}ms over {} candidates",
+                        vision_outcome.reason, vision_outcome.latency_ms,
+                        min(len(output), self._settings.deepseek_vision_candidate_limit),
+                    )
+                    if vision_outcome.applied:
+                        local_rank = {
+                            self._candidate_key(row): rank
+                            for rank, row in enumerate(output, start=1)
+                        }
+                        vision_rank = {
+                            self._candidate_key(row): rank
+                            for rank, row in enumerate(
+                                vision_outcome.candidates, start=1
+                            )
+                        }
+                        merged = []
+                        for row in vision_outcome.candidates:
+                            key = self._candidate_key(row)
+                            score = (
+                                1.0 / (10.0 + local_rank[key])
+                                + 1.2 / (10.0 + vision_rank[key])
+                            )
+                            item = dict(row)
+                            item["deepseek_vision_fusion_score"] = round(score, 6)
+                            merged.append(item)
+                        eligible = [
+                            item for item in merged
+                            if not item.get("deepseek_vision_ineligible", False)
+                        ]
+                        rejected = [
+                            item for item in merged
+                            if item.get("deepseek_vision_ineligible", False)
+                        ]
+                        eligible.sort(
+                            key=lambda item: -item["deepseek_vision_fusion_score"]
+                        )
+                        rejected.sort(
+                            key=lambda item: -item["deepseek_vision_fusion_score"]
+                        )
+                        output = eligible + rejected
+                        # First critic locks the episode family.  Reuse the
+                        # persisted visual vectors to scan every KCP event in
+                        # the top five videos; no second API call in this
+                        # experiment.
+                        # Combine the first critic's visual choices with the
+                        # independent video-RRF shortlist. This prevents a
+                        # single critic pass from dropping a GT video that is
+                        # strong in another retrieval family.
+                        critic_videos = list(dict.fromkeys(
+                            str(item["video_id"]) for item in output
+                        ))[:10]
+                        rrf_seed_videos = [
+                            str(item["video_id"])
+                            for item in sorted(
+                                output,
+                                key=lambda item: float(
+                                    (item.get("fusion_breakdown") or {}).get(
+                                        "kcp_deep_video_rank", 1e9
+                                    )
+                                ),
+                            )
+                            if float((item.get("fusion_breakdown") or {}).get(
+                                "kcp_deep_video_rank", 1e9
+                            )) < 1e9
+                        ]
+                        independent_videos = list(getattr(
+                            self._hybrid, "_last_deep_video_shortlist", []) or [])
+                        vtg_videos = list(dict.fromkeys(
+                            str(item.video_id) for item in vtg_candidates
+                        ))
+                        locked_videos = list(dict.fromkeys(
+                            [
+                                *vtg_videos,
+                                *independent_videos,
+                                *critic_videos,
+                                *rrf_seed_videos,
+                            ]
+                        ))[: self._settings.deepseek_vision_locked_video_limit]
+                        logger.info(
+                            "DeepSeek video shortlist top20={}",
+                            list(dict.fromkeys(
+                                str(item["video_id"]) for item in output
+                            ))[:20],
+                        )
+                        localized = self._hybrid.build_locked_video_kcp_candidates(
+                            self._hybrid._visual_target_query(query),
+                            locked_videos,
+                            output_limit=self._settings.deepseek_vision_candidate_limit,
+                        )
+                        if vtg_candidates:
+                            localized = self._merge_vtg_candidates(
+                                localized,
+                                [
+                                    candidate
+                                    for candidate in vtg_candidates
+                                    if str(candidate.video_id) in set(locked_videos)
+                                ],
+                                limit=self._settings.deepseek_vision_candidate_limit,
+                            )
+                        if localized:
+                            localized_output = self._format_results(localized, query)
+                            second_outcome = self._deepseek_vision_reranker.rerank(
+                                query,
+                                localized_output,
+                                candidate_limit=(
+                                    self._settings.deepseek_vision_candidate_limit
+                                ),
+                                timeout=(
+                                    self._settings.deepseek_vision_timeout_seconds
+                                ),
+                            )
+                            logger.info(
+                                "DeepSeek Vision pass-2 {} in {:.1f}ms over {} "
+                                "localized candidates",
+                                second_outcome.reason,
+                                second_outcome.latency_ms,
+                                min(
+                                    len(localized_output),
+                                    self._settings.deepseek_vision_candidate_limit,
+                                ),
+                            )
+                            if second_outcome.applied:
+                                local_rank_2 = {
+                                    self._candidate_key(row): rank
+                                    for rank, row in enumerate(
+                                        localized_output, start=1
+                                    )
+                                }
+                                vision_rank_2 = {
+                                    self._candidate_key(row): rank
+                                    for rank, row in enumerate(
+                                        second_outcome.candidates, start=1
+                                    )
+                                }
+                                pass2_rows = []
+                                for row in second_outcome.candidates:
+                                    key = self._candidate_key(row)
+                                    # The second critic sees only five locked
+                                    # videos and KCP-localized frames, so its
+                                    # visual judgment is more informative than
+                                    # the coarse local order. Keep late fusion
+                                    # as a guard against a malformed ranking.
+                                    score = (
+                                        1.0 / (10.0 + local_rank_2[key])
+                                        + 2.0 / (10.0 + vision_rank_2[key])
+                                    )
+                                    item = dict(row)
+                                    item["deepseek_vision_pass"] = 2
+                                    item["deepseek_vision_fusion_score"] = round(
+                                        score, 6
+                                    )
+                                    pass2_rows.append(item)
+                                pass2_rows.sort(
+                                    key=lambda item: -item[
+                                        "deepseek_vision_fusion_score"
+                                    ]
+                                )
+                                # Keep the full 100-image context for the
+                                # second critic, but expose only its top 50
+                                # frames to the UI/API.
+                                output = pass2_rows[:50]
+                            else:
+                                output = localized_output[:50]
+            # If the optional first DeepSeek critic is unavailable (for
+            # example API billing/timeout), still execute the GT-free local
+            # Video-Lock pass.  Previously this pass was nested under
+            # ``vision_outcome.applied`` and was skipped on fallback, leaving
+            # temporal-chain candidates ahead of the actual local evidence.
+            if (
+                deepseek_vision
+                and self._deepseek_vision_reranker is not None
+                and "vision_outcome" in locals()
+                and not vision_outcome.applied
+            ):
+                fallback_videos = list(dict.fromkeys(
+                    [
+                        *list(getattr(
+                            self._hybrid, "_last_deep_video_shortlist", []) or []),
+                        *[str(item.get("video_id")) for item in output],
+                    ]
+                ))[: self._settings.deepseek_vision_locked_video_limit]
+                fallback_localized = (
+                    self._hybrid.build_locked_video_kcp_candidates(
+                        self._hybrid._visual_target_query(query),
+                        fallback_videos,
+                        output_limit=self._settings.deepseek_vision_candidate_limit,
+                    )
+                    if fallback_videos else []
+                )
+                if vtg_candidates:
+                    fallback_localized = self._merge_vtg_candidates(
+                        fallback_localized,
+                        [
+                            candidate for candidate in vtg_candidates
+                            if str(candidate.video_id) in set(fallback_videos)
+                        ],
+                        limit=self._settings.deepseek_vision_candidate_limit,
+                    )
+                if fallback_localized:
+                    output = self._format_results(
+                        fallback_localized, query
+                    )[:top_k]
+                    logger.info(
+                        "Video-Lock local fallback used {} videos / {} frames",
+                        len(fallback_videos), len(output),
+                    )
+
+            # Multi-mode is an explicit retrieval ablation.  Do not let the
+            # optional Qwen/DeepSeek text critic silently reintroduce a fourth
+            # modality or change the requested visual/OCR/ASR-only contract.
+            # Standard ``none`` retains the existing final-rerank behavior.
+            # Lock-Video already has its explicit visual critic/VTG branch.
+            # Do not make the legacy Qwen/text cascade a hidden second
+            # network dependency (it is commonly unavailable on the shared
+            # server and only adds a timeout/fallback); callers can still
+            # opt into the text reranker explicitly.
+            if multimodal_mode == "none" and (
+                search_mode != "video_lock" or bool(deepseek_rerank)
+            ):
+                output = self._cascade_final_rerank(
+                    _rerank_task, query, output, deepseek_override=deepseek_rerank
+                )[:top_k]
+            else:
+                output = output[:top_k]
+            elapsed = time.time() - start_time
+            logger.info(
+                f"KIS completed in {elapsed:.2f}s — {len(output)} results"
+            )
+
+            cache.set_results(query, output, top_k=top_k, **cache_semantics)
+            return output
+
+        except Exception as e:
+            logger.error(f"KIS search failed: {e}\n{traceback.format_exc()}")
+            return []
+
+    def search_selected_video_frames(
+        self,
+        query: str,
+        selected_frames: List[Dict[str, Any]],
+        top_k_per_video: int = 100,
+        output_limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return up to ``output_limit`` strong frames from selected videos.
+
+        This is an explicit second-stage operation for the UI's
+        ``Chọn video`` action.  It never searches the global FAISS result
+        pool again: the visual rankers reconstruct and score only the
+        selected videos, then a small, per-model RRF is applied locally.  The
+        output is balanced: the best available local frame from every
+        selected video is kept before the remaining frames compete globally.
+        The frame that the user clicked is retained as a safe fallback when
+        a model has no hit for that video; it is not used as a relevance
+        score, so selecting a frame cannot leak a ranking advantage.
+
+        ``selected_frames`` contains ``{"video_id", "frame_id"}`` pairs.
+        At most twenty unique videos are accepted by the API to keep this
+        interactive operation bounded on the shared server.
+        """
+        text = str(query or "").strip()
+        if not text:
+            raise ValueError("query must not be empty")
+        if not selected_frames:
+            raise ValueError("select at least one video")
+        try:
+            output_limit = max(1, min(int(output_limit), 100))
+        except (TypeError, ValueError):
+            output_limit = 100
+
+        selections: List[Dict[str, Any]] = []
+        seen_videos = set()
+        for raw in selected_frames:
+            if not isinstance(raw, dict):
+                continue
+            video_id = str(raw.get("video_id", "")).strip()
+            # The endpoint performs the strict organizer-id validation.  The
+            # service method also rejects path-like values when called from a
+            # test or another internal caller.
+            if not video_id or "/" in video_id or "\\" in video_id:
+                continue
+            if video_id in seen_videos:
+                continue
+            try:
+                frame_id = int(raw.get("frame_id"))
+            except (TypeError, ValueError):
+                frame_id = None
+            if frame_id is not None and frame_id < 0:
+                frame_id = None
+            selections.append({"video_id": video_id, "frame_id": frame_id})
+            seen_videos.add(video_id)
+            if len(selections) >= 20:
+                break
+        if not selections:
+            raise ValueError("no valid selected videos")
+
+        video_ids = [item["video_id"] for item in selections]
+        per_video_limit = max(1, min(int(top_k_per_video), 600))
+        try:
+            lanes = self._hybrid.search_visual_rankers_in_videos(
+                text,
+                video_ids,
+                top_k_per_video=per_video_limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Selected-video visual search failed: {}", exc)
+            lanes = {}
+
+        # Collapse clause lanes into one local ranked list per visual model.
+        # The existing targeted helper deliberately returns a rank across all
+        # selected videos; recomputing rank here is essential for a fair
+        # per-video winner and avoids a video-count-dependent RRF bias.
+        model_frames: Dict[str, Dict[str, Dict[tuple, SearchSignal]]] = {}
+        for lane_name, signals in (lanes or {}).items():
+            model_name = str(lane_name).split("__", 1)[0]
+            if not model_name.startswith("visual_"):
+                continue
+            per_video = model_frames.setdefault(model_name, {})
+            for signal in signals or []:
+                video_id = str(signal.video_id)
+                if video_id not in seen_videos:
+                    continue
+                key = (video_id, int(signal.frame_id))
+                video_map = per_video.setdefault(video_id, {})
+                previous = video_map.get(key)
+                if previous is None or float(signal.score) > float(previous.score):
+                    video_map[key] = signal
+
+        weights = self._hybrid._rrf_ranker_weights(text)
+        rrf_k = max(1.0, float(getattr(self._settings, "rrf_k", 60)))
+        evidence: Dict[str, Dict[tuple, Dict[str, Any]]] = {
+            video_id: {} for video_id in video_ids
+        }
+        for model_name, by_video in model_frames.items():
+            weight = float(weights.get(model_name, weights.get("visual", 1.0)))
+            for video_id, frame_map in by_video.items():
+                ordered = sorted(
+                    frame_map.values(),
+                    key=lambda signal: (
+                        -float(signal.score),
+                        int(signal.frame_id),
+                    ),
+                )
+                for local_rank, signal in enumerate(ordered, start=1):
+                    key = (video_id, int(signal.frame_id))
+                    item = evidence[video_id].setdefault(
+                        key,
+                        {"rrf": 0.0, "models": {}, "ranks": {}},
+                    )
+                    item["rrf"] += weight / (rrf_k + local_rank)
+                    item["models"][model_name] = max(
+                        float(signal.score),
+                        float(item["models"].get(model_name, -1e9)),
+                    )
+                    item["ranks"][model_name] = min(
+                        local_rank,
+                        int(item["ranks"].get(model_name, 10**9)),
+                    )
+
+        # Make each video's local evidence list explicit, then select one
+        # winner per video before the remaining candidates are globally
+        # ranked.  This prevents a single selected video from consuming all
+        # 100 slots while still returning more than one frame per video.
+        video_order = {item["video_id"]: idx
+                       for idx, item in enumerate(selections)}
+        per_video_ranked: Dict[str, List[Dict[str, Any]]] = {}
+        for selection in selections:
+            video_id = selection["video_id"]
+            candidates = evidence.get(video_id, {})
+            ranked = []
+            for key, item in candidates.items():
+                ranked.append({
+                    "video_id": video_id,
+                    "frame_id": int(key[1]),
+                    "item": item,
+                    "fallback": False,
+                    "seed_frame_id": selection.get("frame_id"),
+                })
+            ranked.sort(key=lambda entry: (
+                -float(entry["item"]["rrf"]),
+                -max(entry["item"]["models"].values(), default=-1e9),
+                int(entry["frame_id"]),
+            ))
+            if not ranked and selection.get("frame_id") is not None:
+                # Preserve the selected frame only when local visual search
+                # has no evidence for that video.  It receives no score bonus.
+                ranked.append({
+                    "video_id": video_id,
+                    "frame_id": int(selection["frame_id"]),
+                    "item": {"rrf": 0.0, "models": {}, "ranks": {}},
+                    "fallback": True,
+                    "seed_frame_id": selection.get("frame_id"),
+                })
+            per_video_ranked[video_id] = ranked
+
+        selected_entries: List[Dict[str, Any]] = []
+        selected_keys = set()
+        # Fairness pass: at least one usable frame per selected video.
+        for selection in selections:
+            video_id = selection["video_id"]
+            ranked = per_video_ranked.get(video_id, [])
+            if not ranked:
+                continue
+            entry = ranked[0]
+            key = (entry["video_id"], entry["frame_id"])
+            if key not in selected_keys:
+                selected_keys.add(key)
+                selected_entries.append(entry)
+
+        remaining = []
+        for video_id, ranked in per_video_ranked.items():
+            for entry in ranked[1:]:
+                key = (entry["video_id"], entry["frame_id"])
+                if key not in selected_keys:
+                    remaining.append(entry)
+        remaining.sort(key=lambda entry: (
+            -float(entry["item"]["rrf"]),
+            -max(entry["item"]["models"].values(), default=-1e9),
+            video_order.get(entry["video_id"], 10**9),
+            int(entry["frame_id"]),
+        ))
+        entries = (selected_entries + remaining)[:output_limit]
+
+        fused: List[FusedResult] = []
+        metadata: List[Dict[str, Any]] = []
+        for entry in entries:
+            video_id = entry["video_id"]
+            frame_id = int(entry["frame_id"])
+            item = entry["item"]
+            model_scores = {
+                name: float(score)
+                for name, score in item["models"].items()
+            }
+            local_ranks = {
+                name: int(rank)
+                for name, rank in item["ranks"].items()
+            }
+            is_fallback = bool(entry["fallback"])
+            fused.append(
+                FusedResult(
+                    video_id=video_id,
+                    frame_id=frame_id,
+                    rrf_score=float(item["rrf"]),
+                    visual_score=max(model_scores.values(), default=0.0),
+                    visual_model_scores=model_scores,
+                    fusion_breakdown={
+                        "selected_video_filter": 1.0,
+                        "selected_video_fallback": 1.0 if is_fallback else 0.0,
+                        "visual_model_support": float(len(model_scores)),
+                        **{
+                            f"{name}_local_rank": float(rank)
+                            for name, rank in local_ranks.items()
+                        },
+                    },
+                )
+            )
+            metadata.append({
+                "selected_video_id": video_id,
+                "selected_seed_frame_id": entry["seed_frame_id"],
+                "selected_video_fallback": is_fallback,
+            })
+
+        for rank, row in enumerate(fused, start=1):
+            row.rank = rank
+        output = self._format_results(fused, text)
+        for row, meta in zip(output, metadata):
+            row.update(meta)
+            row["filter_rank"] = row.get("rank", 0)
+            row["filter_scope"] = "selected_video_visual_local"
+        return output
+
+    # ─── TRAKE ───────────────────────────────────────────────────────────────
+
+    def search_kis_by_image(self, image: Any, top_k: int = 10) -> List[Dict[str, Any]]:
+        """KIS visual search using an example image."""
+        try:
+            signals = self._hybrid.search_visual_by_image(image, top_k=top_k)
+            video_meta = self._rm.load_video_metadata()
+            output = []
+            for r in signals:
+                frame_path = self._resolve_frame_path(r.video_id, r.frame_id)
+                info = video_meta.get(r.video_id, {})
+                output.append({"video_id": r.video_id, "frame_id": r.frame_id,
+                    "frame_path": str(frame_path) if frame_path else None,
+                    "frame_exists": bool(frame_path and frame_path.exists()),
+                    "score": round(r.score, 4), "visual_score": round(r.score, 4),
+                    "visual_raw_score": round(getattr(r, "raw_score", r.score), 4), "rank": r.rank,
+                    "visual_raw_score": round(r.score, 4), "rank": r.rank,
+                    "watch_url": info.get("watch_url", ""), "duration": info.get("duration", 0),
+                    "timestamp_seconds": round(r.frame_id / self._rm.get_video_fps(r.video_id), 1)})
+            return output
+        except Exception as exc:
+            logger.error(f"KIS-V image search failed: {exc}")
+            return []
+
+    def _trake_video_frame_ids(self, video_id: str) -> List[int]:
+        """Return original keyframe ids available for one locked video."""
+        found = set()
+        try:
+            mapping = self._rm.load_frame_mapping()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("TRAKE frame mapping unavailable: {}", exc)
+            mapping = {}
+        if isinstance(mapping, dict):
+            for metadata in mapping.values():
+                if not isinstance(metadata, dict):
+                    continue
+                if str(metadata.get("video_id", "")) != str(video_id):
+                    continue
+                try:
+                    frame_id = int(metadata["frame_number"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if frame_id >= 0:
+                    found.add(frame_id)
+        if found:
+            return sorted(found)
+        try:
+            event_index = self._hybrid._get_kcp_event_index()
+            if event_index is not None:
+                for _event_id, frames in event_index.ordered_events(video_id):
+                    for frame in frames:
+                        try:
+                            frame_id = int(frame)
+                        except (TypeError, ValueError):
+                            continue
+                        if frame_id >= 0:
+                            found.add(frame_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("TRAKE KCP frame fallback unavailable: {}", exc)
+        return sorted(found)
+
+    def _trake_anchor_seed(
+        self,
+        anchor_query: Optional[str],
+        video_id: Optional[str],
+        anchor_frame_id: Optional[int],
+    ) -> tuple[str, int, str]:
+        """Resolve a manual or KIS-derived video/frame anchor."""
+        query = (anchor_query or "").strip()
+        locked_video = (video_id or "").strip()
+        if not locked_video and not query:
+            raise ValueError(
+                "anchor_query is required when video_id is not supplied"
+            )
+
+        if not locked_video:
+            anchor_results = self.search_kis(
+                query,
+                top_k=100,
+                diversify_for_ui=False,
+                deepseek_vision=False,
+                deepseek_rerank=False,
+            )
+            if not anchor_results:
+                raise ValueError("KIS found no video for anchor_query")
+            first = anchor_results[0]
+            locked_video = str(first.get("video_id", "")).strip()
+            if not locked_video:
+                raise ValueError("KIS anchor result has no video_id")
+            if anchor_frame_id is None:
+                try:
+                    anchor_frame_id = int(first["frame_id"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "KIS anchor result has no valid frame_id"
+                    ) from exc
+            return locked_video, int(anchor_frame_id), "kis_anchor"
+
+        if anchor_frame_id is not None:
+            return locked_video, int(anchor_frame_id), "manual_video_frame"
+        if not query:
+            logger.warning(
+                "TRAKE manual video lock has no anchor frame; using video start"
+            )
+            return locked_video, 0, "manual_video_start"
+
+        anchor_results = self.search_kis(
+            query,
+            top_k=100,
+            diversify_for_ui=False,
+            deepseek_vision=False,
+            deepseek_rerank=False,
+        )
+        for result in anchor_results or []:
+            if str(result.get("video_id", "")).strip() != locked_video:
+                continue
+            try:
+                return locked_video, int(result["frame_id"]), "kis_manual_video"
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        try:
+            targeted = self._hybrid.search_visual_rankers_in_videos(
+                query, [locked_video], top_k_per_video=100
+            )
+            signals = [
+                signal
+                for rows in targeted.values()
+                for signal in rows
+            ]
+            if signals:
+                best = min(
+                    signals,
+                    key=lambda signal: (
+                        max(1, int(signal.rank)),
+                        -float(signal.score),
+                        int(signal.frame_id),
+                    ),
+                )
+                return locked_video, int(best.frame_id), "targeted_anchor"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Targeted TRAKE anchor lookup failed: {}", exc)
+        return locked_video, 0, "manual_video_start"
+    def _trake_boundary_frames(
+        self,
+        video_id: str,
+        frame_ids: List[int],
+        *,
+        seed_frame: int,
+        end_frame: int,
+        fps: float,
+    ) -> List[int]:
+        """Detect strong visual changes to expose likely first-shot frames."""
+        try:
+            from PIL import Image
+        except Exception:
+            return []
+        relevant = [
+            frame for frame in sorted(set(frame_ids))
+            if max(0, int(seed_frame - fps)) <= frame <= int(end_frame)
+        ]
+        if len(relevant) < 2:
+            return []
+        changes = []
+        previous = None
+        for frame in relevant:
+            try:
+                path = self._resolve_frame_path(video_id, frame)
+                if path is None:
+                    continue
+                with Image.open(path) as image:
+                    current = np.asarray(
+                        image.convert("L").resize((160, 90)),
+                        dtype=np.float32,
+                    )
+            except Exception:
+                continue
+            if previous is not None:
+                changes.append((float(np.mean(np.abs(current - previous))), frame))
+            previous = current
+        if not changes:
+            return []
+        values = np.asarray([value for value, _frame in changes], dtype=np.float32)
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        threshold = max(30.0, median + max(12.0, 4.0 * mad))
+        chosen = []
+        for value, frame in sorted(changes, reverse=True):
+            if value < threshold:
+                break
+            if any(abs(frame - other) < int(max(1.0, fps * 0.8)) for other in chosen):
+                continue
+            chosen.append(int(frame))
+            if len(chosen) >= 8:
+                break
+        return sorted(chosen)
+
+    @staticmethod
+    def _trake_event_can_use_forward_bridge(event: str) -> bool:
+        """Identify completion/turn events that benefit from a later landmark."""
+        text = str(event or "").casefold()
+        progress_markers = (
+            "hoàn tất",
+            "complete",
+            "finish",
+            "turn",
+            "xoay",
+            "đặt trên",
+            "pole",
+            "trụ",
+        )
+        return any(marker in text for marker in progress_markers)
+
+    @staticmethod
+    def _trake_anchor_onset_allowed(
+        event: str,
+        anchor_text: str,
+        seed_source: str,
+    ) -> bool:
+        """Allow an explicit opening anchor to represent E1 onset.
+
+        A still cannot prove that a dynamic action is moving. When the user
+        explicitly describes the anchor as the opening and E1 asks for the
+        first appearance, the indexed anchor is the only honest earliest
+        candidate; use it as a low-confidence prior only when the event
+        refiner has no positive selection.
+        """
+        if seed_source not in {
+            "manual_video_frame",
+            "kis_anchor",
+            "kis_manual_video",
+            "targeted_anchor",
+        }:
+            return False
+        anchor = str(anchor_text or "").casefold()
+        event_text = str(event or "").casefold()
+        opening_markers = (
+            "đoạn video bắt đầu",
+            "bắt đầu bằng",
+            "mở đầu",
+            "video starts",
+            "opening shot",
+            "begins with",
+        )
+        first_markers = ("đầu tiên", "first", "first appearance", "first time")
+        appearance_markers = (
+            "xuất hiện",
+            "appear",
+            "đầy đủ",
+            "visible",
+            "fully visible",
+        )
+        return (
+            any(marker in anchor for marker in opening_markers)
+            and any(marker in event_text for marker in first_markers)
+            and any(marker in event_text for marker in appearance_markers)
+        )
+
+    def _search_trake_anchor_locked(
+        self,
+        events: List[str],
+        *,
+        top_k_videos: int,
+        max_missing_events: int,
+        anchor_query: Optional[str],
+        video_id: Optional[str],
+        anchor_frame_id: Optional[int],
+        window_seconds: float,
+        scan_fps: float,
+    ) -> List[Dict[str, Any]]:
+        """Resolve every event from one symmetric timeline in one Vision call."""
+        from src.search.trake_anchor import sample_interval_frame_ids
+
+        del top_k_videos
+        if max_missing_events:
+            logger.warning(
+                "Anchor-locked TRAKE remains strict; max_missing_events={} is ignored",
+                max_missing_events,
+            )
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        if scan_fps <= 0:
+            raise ValueError("scan_fps must be positive")
+
+        locked_video, seed_frame, seed_source = self._trake_anchor_seed(
+            anchor_query, video_id, anchor_frame_id
+        )
+        frame_ids = self._trake_video_frame_ids(locked_video)
+        if not frame_ids:
+            logger.warning(
+                "Anchor-locked TRAKE has no local frame ids for video {}",
+                locked_video,
+            )
+            return []
+        requested_seed_frame = int(seed_frame)
+        seed_frame = min(
+            frame_ids,
+            key=lambda frame: (abs(int(frame) - requested_seed_frame), int(frame)),
+        )
+        if seed_frame != requested_seed_frame:
+            logger.info(
+                "TRAKE anchor {} snapped to indexed keyframe {} for video {}",
+                requested_seed_frame,
+                seed_frame,
+                locked_video,
+            )
+
+        vision = getattr(self, "_deepseek_vision_reranker", None)
+        if vision is None or not callable(
+            getattr(vision, "rerank_trake_window", None)
+        ):
+            logger.warning("DeepSeek Vision TRAKE reranker is unavailable")
+            return []
+
+        fps = float(self._rm.get_video_fps(locked_video))
+        if fps <= 0:
+            raise ValueError("video fps must be positive")
+        max_window = float(getattr(
+            self._settings, "trake_anchor_max_window_seconds", 180.0
+        ))
+        candidate_limit = int(getattr(
+            self._settings, "trake_anchor_candidate_limit", 350
+        ))
+        timeout = float(getattr(
+            self._settings, "deepseek_vision_timeout_seconds", 180.0
+        ))
+        used_window = min(float(window_seconds), max_window)
+        half_window_frames = used_window * fps / 2.0
+        start_frame = max(
+            int(frame_ids[0]),
+            int(math.floor(seed_frame - half_window_frames)),
+        )
+        end_frame = min(
+            int(frame_ids[-1]),
+            int(math.ceil(seed_frame + half_window_frames)),
+        )
+        sampled = sample_interval_frame_ids(
+            frame_ids,
+            fps=fps,
+            start_frame_id=start_frame,
+            end_frame_id=end_frame,
+            sample_fps=scan_fps,
+            max_frames=candidate_limit,
+            required_frame_ids=(seed_frame,),
+        )
+        boundary_frames = self._trake_boundary_frames(
+            locked_video,
+            frame_ids,
+            seed_frame=start_frame,
+            end_frame=end_frame,
+            fps=fps,
+        )
+        boundary_span = max(2, int(round(0.15 * fps)))
+        candidates = []
+        for frame in sampled:
+            row = {
+                "video_id": locked_video,
+                "frame_id": frame,
+                "timestamp_seconds": frame / fps,
+            }
+            if frame == int(seed_frame):
+                row["_anchor_reference"] = True
+            frame_path = self._resolve_frame_path(locked_video, frame)
+            if frame_path is not None:
+                row["_frame_path"] = str(frame_path)
+            if any(
+                abs(frame - boundary) <= boundary_span
+                for boundary in boundary_frames
+            ):
+                row["_shot_boundary"] = True
+            candidates.append(row)
+
+        anchor_text = (anchor_query or "").strip()
+        outcome = vision.rerank_trake_window(
+            anchor_text,
+            events,
+            candidates,
+            candidate_limit=candidate_limit,
+            timeout=timeout,
+        )
+        logger.info(
+            "TRAKE one-pass Vision window={}s video={} frames={} range={}:{} "
+            "boundaries={} reason={} applied={}",
+            used_window,
+            locked_video,
+            len(candidates),
+            start_frame,
+            end_frame,
+            len(boundary_frames),
+            outcome.reason,
+            outcome.applied,
+        )
+        if not outcome.applied or any(
+            frame is None for frame in outcome.frame_ids
+        ):
+            logger.warning(
+                "Anchor-locked TRAKE found no complete chain video={} reason={}",
+                locked_video,
+                outcome.reason,
+            )
+            return []
+
+        selected_frames = [int(frame) for frame in outcome.frame_ids]
+        confidences = [
+            max(0.0, min(1.0, float(score)))
+            for score in outcome.confidences
+        ]
+        mean_score = sum(confidences) / len(confidences) if confidences else 0.0
+        weakest_score = min(confidences) if confidences else 0.0
+        return [{
+            "video_id": locked_video,
+            "frame_ids": selected_frames,
+            "moment_scores": [round(score, 4) for score in confidences],
+            "total_score": round(sum(confidences), 4),
+            "sequence_score": round(weakest_score, 4),
+            "ranking_score": round(
+                0.7 * weakest_score + 0.3 * mean_score, 4
+            ),
+            "missing_events": 0,
+            "timestamps_seconds": [
+                round(frame / fps, 1) for frame in selected_frames
+            ],
+            "rank": 1,
+            "anchor_query": anchor_text,
+            "anchor_frame_id": int(seed_frame),
+            "anchor_timestamp_seconds": round(seed_frame / fps, 1),
+            "anchor_source": seed_source,
+            "vision_window_seconds": round(used_window, 1),
+            "vision_window_start_frame": int(start_frame),
+            "vision_window_end_frame": int(end_frame),
+            "vision_scan_fps": float(scan_fps),
+            "vision_applied": True,
+            "vision_refined": False,
+            "vision_request_count": 1,
+            "vision_reason": f"one_pass_timeline:{outcome.reason}",
+        }]
+
+    def search_trake(
+        self,
+        events: List[str],
+        top_k_videos: int = 10,
+        per_event_pool: int = 100,
+        max_missing_events: int = 0,
+        anchor_query: Optional[str] = None,
+        video_id: Optional[str] = None,
+        anchor_frame_id: Optional[int] = None,
+        window_seconds: float = 30.0,
+        scan_fps: float = 5.0,
+    ) -> List[Dict[str, Any]]:
+        """TRAKE: align an ordered sequence of event descriptions to frames.
+
+        Output shape follows the organizer contract locked in
+        src/eval/aic2026_preliminary.py::TRAKEAnswer — one video plus exactly
+        one frame_id per semantic moment, frames strictly increasing. Each
+        event runs through the full hybrid RRF search independently. A loose
+        24-frame per-video cap prevents a few videos from consuming the whole
+        global pool while leaving enough local alternatives for alignment; then
+        rank_trake_videos picks, per video, the strictly-increasing
+        assignment using event-calibrated evidence and a soft temporal prior.
+
+        ``max_missing_events`` (default 0, strict) allows a video to skip up
+        to that many events and still be ranked — with the strict default,
+        a real 4-event TRAKE query against the live corpus returned zero
+        videos (no single video ranked in every event's own top-N pool);
+        see aic2026-backend-api-gap memory. Skipped events show as ``null``
+        in ``frame_ids``/``timestamps_seconds`` rather than being dropped,
+        since the organizer contract expects one slot per requested moment.
+        """
+        self._query_count += 1
+        if not events or any(not e.strip() for e in events):
+            raise ValueError("events must be a non-empty list of non-empty strings")
+        logger.info(
+            f"TRAKE query #{self._query_count}: {len(events)} events, "
+            f"top_k_videos={top_k_videos}, max_missing_events={max_missing_events}"
+        )
+        start_time = time.time()
+
+        from src.search.hybrid_search import reciprocal_rank_fusion
+        from src.search.hybrid_fusion import align_visual_rankers_to_windows
+        from src.search.trake_search import (
+            TrakeCandidate,
+            align_events_in_video,
+            propose_trake_videos,
+            rank_trake_videos,
+        )
+
+        try:
+            if (
+                anchor_query is not None
+                or video_id is not None
+                or anchor_frame_id is not None
+            ):
+                return self._search_trake_anchor_locked(
+                    events,
+                    top_k_videos=top_k_videos,
+                    max_missing_events=max_missing_events,
+                    anchor_query=anchor_query,
+                    video_id=video_id,
+                    anchor_frame_id=anchor_frame_id,
+                    window_seconds=window_seconds,
+                    scan_fps=scan_fps,
+                )
+            per_event_hits: List[Dict[str, List[TrakeCandidate]]] = []
+            event_top_scores: List[float] = []
+            for event_text in events:
+                fused = self._hybrid.search(
+                    query_text=event_text,
+                    top_k=per_event_pool,
+                    rrf_k=self._settings.rrf_k,
+                    # Preserve the validated global TRAKE baseline exactly.
+                    # Video diversity/recovery belongs to stage 2; changing
+                    # this pool caused a confirmed lion-dance regression.
+                    max_per_video=None,
+                )
+                top_score = max((r.rrf_score for r in fused), default=0.0)
+                event_top_scores.append(top_score)
+                event_hits: Dict[str, List[TrakeCandidate]] = {}
+                for r in fused:
+                    fps = self._rm.get_video_fps(r.video_id)
+                    event_hits.setdefault(r.video_id, []).append(
+                        TrakeCandidate(
+                            frame_id=r.frame_id,
+                            score=r.rrf_score,
+                            objective_score=(
+                                r.rrf_score / top_score if top_score > 0 else 0.0
+                            ),
+                            timestamp_seconds=r.frame_id / fps,
+                        )
+                    )
+                per_event_hits.append(event_hits)
+
+            # Stage 1: fuse video ranks across events. Unlike a strict early
+            # intersection, this preserves strong N-1 candidates for recovery.
+            proposal_count = min(50, max(20, top_k_videos * 5))
+            proposals = propose_trake_videos(
+                per_event_hits,
+                top_k_videos=proposal_count,
+                rrf_k=10,
+            )
+            proposal_video_ids = [proposal.video_id for proposal in proposals]
+
+            # Stage 2: exhaustive visual scoring only inside shortlisted
+            # videos. Reuses the already-loaded indexes and cached query
+            # embeddings; no JPEG decoding and no second model instance.
+            targeted_search = getattr(
+                self._hybrid, "search_visual_rankers_in_videos", None
+            )
+            if callable(targeted_search) and proposal_video_ids:
+                for event_idx, event_text in enumerate(events):
+                    targeted_rankers = targeted_search(
+                        event_text,
+                        proposal_video_ids,
+                        top_k_per_video=24,
+                    )
+                    targeted_rankers = align_visual_rankers_to_windows(
+                        targeted_rankers,
+                        fps_lookup=self._rm.get_video_fps,
+                        window_seconds=self._settings.fusion_visual_window_seconds,
+                    )
+                    ranked_lists = [
+                        [
+                            (f"{signal.video_id}:{signal.frame_id}", signal.rank)
+                            for signal in signals
+                        ]
+                        for signals in targeted_rankers.values()
+                        if signals
+                    ]
+                    if not ranked_lists:
+                        continue
+                    targeted_scores = reciprocal_rank_fusion(ranked_lists, k=10)
+                    # Calibrate against theoretical all-ranker agreement, not
+                    # the strongest observed shortlist hit. Otherwise a weak
+                    # single-model rank-1 becomes an unjustified objective 1.0.
+                    targeted_ceiling = len(ranked_lists) / 11.0
+                    signal_by_doc = {}
+                    for signals in targeted_rankers.values():
+                        for signal in signals:
+                            doc_id = f"{signal.video_id}:{signal.frame_id}"
+                            signal_by_doc.setdefault(doc_id, signal)
+                    raw_scale = event_top_scores[event_idx]
+                    for doc_id, targeted_score in targeted_scores.items():
+                        signal = signal_by_doc[doc_id]
+                        objective = (
+                            min(1.0, targeted_score / targeted_ceiling)
+                            if targeted_ceiling > 0
+                            else 0.0
+                        )
+                        existing = per_event_hits[event_idx].get(signal.video_id)
+                        if existing:
+                            # Temporal repair: allow a new frame to resolve an
+                            # otherwise impossible ordering, but never give it
+                            # more confidence than global multimodal retrieval
+                            # already assigned to this video/event.
+                            global_ceiling = max(
+                                candidate.optimization_score
+                                for candidate in existing
+                            )
+                            objective = min(objective, global_ceiling)
+                        else:
+                            # Pure visual evidence may fill a missing event,
+                            # but cannot contribute a full-confidence 1.0 by
+                            # itself (e.g. decorative dragon vs moving dragon).
+                            objective = min(objective, 0.5)
+                        per_event_hits[event_idx].setdefault(signal.video_id, []).append(
+                            TrakeCandidate(
+                                frame_id=signal.frame_id,
+                                score=raw_scale * objective,
+                                objective_score=objective,
+                                timestamp_seconds=(
+                                    signal.frame_id
+                                    / self._rm.get_video_fps(signal.video_id)
+                                ),
+                            )
+                        )
+
+            # Qwen ``actions`` describes coarse temporal segments rather than
+            # exact keyframes.  Use it only as an ordered, video-level prior:
+            # it may reorder visually valid alignments, but it never chooses
+            # or replaces the organizer-facing frame ids above.
+            action_priors: Dict[str, float] = {}
+            action_search = getattr(
+                self._hybrid, "search_qwen_actions_in_videos", None
+            )
+            action_prior_enabled = bool(
+                getattr(self._settings, "trake_action_prior_enabled", False)
+            )
+            if action_prior_enabled and callable(action_search) and proposal_video_ids:
+                action_hits_by_event: List[Dict[str, List[TrakeCandidate]]] = []
+                for event_text in events:
+                    action_hits = action_search(
+                        event_text,
+                        proposal_video_ids,
+                        top_k_per_video=8,
+                    )
+                    event_candidates: Dict[str, List[TrakeCandidate]] = {}
+                    for video_id, signals in action_hits.items():
+                        fps = self._rm.get_video_fps(video_id)
+                        candidates = []
+                        for signal in signals:
+                            # BGE-M3 cosine is not directly comparable with
+                            # event-calibrated visual RRF.  Map only meaningful
+                            # semantic matches into [0, 1]; weak generic action
+                            # prose contributes no prior.
+                            semantic_confidence = max(
+                                0.0, min(1.0, (signal.score - 0.35) / 0.45)
+                            )
+                            rank_confidence = 1.0 / (
+                                1.0 + max(signal.rank - 1, 0) / 500.0
+                            )
+                            confidence = semantic_confidence * rank_confidence
+                            if confidence <= 0.0:
+                                continue
+                            candidates.append(
+                                TrakeCandidate(
+                                    frame_id=signal.frame_id,
+                                    score=confidence,
+                                    objective_score=confidence,
+                                    timestamp_seconds=signal.frame_id / fps,
+                                )
+                            )
+                        if candidates:
+                            event_candidates[video_id] = candidates
+                    action_hits_by_event.append(event_candidates)
+
+                for video_id in proposal_video_ids:
+                    if any(
+                        video_id not in event_candidates
+                        for event_candidates in action_hits_by_event
+                    ):
+                        continue
+                    action_alignment = align_events_in_video(
+                        [
+                            event_candidates[video_id]
+                            for event_candidates in action_hits_by_event
+                        ],
+                        gap_penalty=0.01,
+                        gap_scale_seconds=60.0,
+                        short_gap_penalty=0.10,
+                        min_gap_seconds=2.0,
+                    )
+                    if action_alignment is not None:
+                        _, action_scores = action_alignment
+                        action_priors[video_id] = sum(action_scores) / len(events)
+
+            alignment_pool_size = top_k_videos
+            if self._final_task_enabled("trake"):
+                alignment_pool_size = max(
+                    top_k_videos,
+                    self._settings.qwen_rerank_candidate_limit,
+                    self._settings.deepseek_rerank_candidate_limit,
+                )
+            alignments = rank_trake_videos(
+                per_event_hits,
+                top_k_videos=alignment_pool_size,
+                max_missing_events=max_missing_events,
+                gap_penalty=0.03,
+                gap_scale_seconds=45.0,
+                short_gap_penalty=0.20,
+                min_gap_seconds=2.0,
+                video_priors=action_priors,
+                video_prior_weight=(
+                    self._settings.trake_action_prior_weight
+                    if action_prior_enabled
+                    else 0.0
+                ),
+            )
+
+            output = []
+            for rank, alignment in enumerate(alignments, start=1):
+                fps = self._rm.get_video_fps(alignment.video_id)
+                output.append({
+                    "video_id": alignment.video_id,
+                    "frame_ids": list(alignment.frame_ids),
+                    "moment_scores": [round(s, 4) for s in alignment.scores],
+                    "total_score": round(alignment.total_score, 4),
+                    "sequence_score": round(
+                        alignment.sequence_score
+                        if alignment.sequence_score is not None
+                        else alignment.total_score,
+                        4,
+                    ),
+                    "action_sequence_score": round(alignment.video_prior, 4),
+                    "ranking_score": round(alignment.ranking_score, 4),
+                    "missing_events": alignment.missing_events,
+                    "timestamps_seconds": [
+                        round(f / fps, 1) if f is not None else None
+                        for f in alignment.frame_ids
+                    ],
+                    "rank": rank,
+                })
+            output = self._cascade_final_rerank(
+                "trake",
+                "\n".join(
+                    f"Event {index + 1}: {event}"
+                    for index, event in enumerate(events)
+                ),
+                output,
+            )[:top_k_videos]
+            elapsed = time.time() - start_time
+            logger.info(
+                f"TRAKE completed in {elapsed:.2f}s — {len(output)} videos"
+            )
+            return output
+
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"TRAKE search failed: {e}\n{traceback.format_exc()}")
+            return []
+
+    # ─── Conversational KIS ──────────────────────────────────────────────────
+
+    def search_ckis(
+        self,
+        messages: List[Dict[str, str]],
+        current_query: str,
+        top_k: int = 10,
+        fusion_weights: Optional[tuple] = None,
+        diversify_for_ui: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Conversational KIS: find keyframes using chat history context.
+
+        Args:
+            messages: List of {"role": "user"/"assistant", "content": "..."}
+            current_query: The latest user query
+        """
+        self._query_count += 1
+        
+        # Simple Option A: Concatenate user messages to build context
+        user_msgs = [m["content"] for m in messages if m.get("role") == "user"]
+        user_msgs.append(current_query)
+        
+        # Use only the last 3 turns to avoid diluting the search too much
+        context_query = " ".join(user_msgs[-3:])
+        
+        logger.info(f"C-KIS query #{self._query_count} context: '{context_query}'")
+        
+        # Dispatch to KIS engine using the contextualized query
+        return self.search_kis(
+            context_query,
+            top_k,
+            fusion_weights,
+            diversify_for_ui=diversify_for_ui,
+        )
+
+    # ─── QA ──────────────────────────────────────────────────────────────────
+
+    def search_qa(
+        self,
+        question: str,
+        top_k: int = 10,
+        diversify_for_ui: bool = True,
+        deepseek_vision: bool = False,
+        deepseek_rerank: Optional[bool] = None,
+        fusion_mode: str = "late",
+        search_mode: str = "standard",
+        multimodal_mode: str = "none",
+        ocr_query: Optional[str] = None,
+        asr_query: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find the frames that contain evidence for a human to answer a question.
+
+        This route intentionally does not generate an answer. DeepSeek, when
+        enabled, only reorders the final evidence frames.
+        """
+        cache = get_query_cache()
+        cached_results = cache.get_results(
+            question,
+            top_k=top_k,
+            task="qa",
+            fusion="hybrid_rank_score_consensus_v2",
+            fusion_mode=fusion_mode,
+            multimodal_mode=multimodal_mode,
+            query_routing="quoted_ocr_v2_multimode_direct_asr_v2",
+            ocr_query=(ocr_query or question).strip(),
+            asr_query=(asr_query or question).strip(),
+            deepseek_rerank=(self._deepseek_task_enabled("qa")
+                             if deepseek_rerank is None else bool(deepseek_rerank)),
+            deepseek_model=self._settings.deepseek_rerank_model,
+            qwen_rerank=self._qwen_task_enabled("qa"),
+            deepseek_vision=bool(deepseek_vision),
+            diversify_for_ui=diversify_for_ui,
+        )
+        if cached_results:
+            return cached_results
+
+        self._query_count += 1
+        logger.info(f"QA query #{self._query_count}: '{question}'")
+
+        try:
+            # QA is essentially KIS for now — enhance with question keywords
+            enhanced_query = question
+            results = self.search_kis(
+                enhanced_query,
+                top_k=top_k,
+                diversify_for_ui=diversify_for_ui,
+                deepseek_vision=deepseek_vision,
+                deepseek_rerank=deepseek_rerank,
+                fusion_mode=fusion_mode,
+                search_mode=search_mode,
+                multimodal_mode=multimodal_mode,
+                ocr_query=ocr_query,
+                asr_query=asr_query,
+                _rerank_task="qa",
+            )
+            cache.set_results(
+                question,
+                results,
+                top_k=top_k,
+                task="qa",
+                fusion="hybrid_rank_score_consensus_v2",
+                fusion_mode=fusion_mode,
+                multimodal_mode=multimodal_mode,
+                query_routing="quoted_ocr_v2_multimode_direct_asr_v2",
+                ocr_query=(ocr_query or question).strip(),
+                asr_query=(asr_query or question).strip(),
+                deepseek_rerank=(self._deepseek_task_enabled("qa")
+                                 if deepseek_rerank is None else bool(deepseek_rerank)),
+                deepseek_model=self._settings.deepseek_rerank_model,
+                qwen_rerank=self._qwen_task_enabled("qa"),
+                deepseek_vision=bool(deepseek_vision),
+                diversify_for_ui=diversify_for_ui,
+            )
+            return results
+
+        except Exception as e:
+            logger.error(f"QA search failed: {e}")
+            return []
+
+    # ─── Moments (VTG grounding input) ──────────────────────────────────────
+
+    def search_moments(
+        self,
+        query: str,
+        top_k_moments: int = 10,
+        **kwargs: Any,
+    ) -> List[Dict[str, Any]]:
+        """Coarse ``[start_frame, end_frame)`` moments for the VTG grounding
+        input contract (docs/KCP_VTG_RUNBOOK.md step 3).
+
+        Reuses this process's already-warm FAISS indexes/encoders via
+        ``self._hybrid``, instead of the several-minute reload a fresh
+        ``HybridSearchEngine()`` (e.g. scripts/export_coarse_moments.py run
+        standalone) pays on every call.
+        """
+        self._query_count += 1
+        logger.info(f"Moments query #{self._query_count}: '{query}'")
+        moments = self._hybrid.search_moments(
+            query, top_k_moments=top_k_moments, **kwargs
+        )
+        return [
+            {
+                "video_id": m.video_id,
+                "start_frame": m.start_frame,
+                "end_frame": m.end_frame,
+                "score": m.score,
+            }
+            for m in moments
+        ]
+
+    # ─── Helpers ─────────────────────────────────────────────────────────────
+
+    def _qwen_task_enabled(self, task: str) -> bool:
+        return bool(
+            getattr(self, "_qwen_reranker", None) is not None
+            and getattr(self._settings, "qwen_rerank_enabled", False)
+            and getattr(self._settings, f"qwen_rerank_{task}_enabled", False)
+        )
+
+    def _final_task_enabled(self, task: str) -> bool:
+        return self._deepseek_task_enabled(task) or self._qwen_task_enabled(task)
+
+    @staticmethod
+    def _candidate_key(candidate: Dict[str, Any]) -> tuple:
+        return (
+            candidate.get("video_id"),
+            candidate.get("frame_id"),
+            tuple(candidate.get("frame_ids", [])),
+        )
+
+    def _final_shortlist(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Reduce local top-100 to Qwen's pool while retaining specialist escapes."""
+        limit = self._settings.qwen_rerank_candidate_limit
+        if len(candidates) <= limit or any("frame_ids" in row for row in candidates):
+            return [dict(row) for row in candidates[:limit]]
+        # For the default pool of 25 this yields 18 fusion candidates plus
+        # 2 visual, 2 OCR, 1 ASR and 2 caption escapes. Scale conservatively
+        # for non-default limits and fill any missing specialist slots below.
+        specialist_slots = min(7, max(0, limit - 1))
+        head_count = max(1, limit - specialist_slots)
+        selected = [dict(row) for row in candidates[:head_count]]
+        seen = {self._candidate_key(row) for row in selected}
+        specialist_quotas = (
+            ("visual_score", 2),
+            ("ocr_score", 2),
+            ("audio_score", 1),
+            ("caption_score", 2),
+        )
+        for score_field, quota in specialist_quotas:
+            added = 0
+            for row in sorted(
+                candidates,
+                key=lambda item: float(item.get(score_field, 0.0) or 0.0),
+                reverse=True,
+            ):
+                if len(selected) >= limit or added >= quota:
+                    break
+                key = self._candidate_key(row)
+                if key not in seen and float(row.get(score_field, 0.0) or 0.0) > 0.0:
+                    selected.append(dict(row))
+                    seen.add(key)
+                    added += 1
+        for row in candidates:
+            if len(selected) >= limit:
+                break
+            key = self._candidate_key(row)
+            if key not in seen:
+                selected.append(dict(row))
+                seen.add(key)
+        return selected[:limit]
+
+    def _cascade_final_rerank(self, task: str, query: str, candidates: List[Dict[str, Any]], deepseek_override: Optional[bool] = None) -> List[Dict[str, Any]]:
+        deepseek_enabled = (self._deepseek_task_enabled(task)
+                            if deepseek_override is None
+                            else bool(deepseek_override) and self._deepseek_reranker is not None)
+        if not (deepseek_enabled or self._qwen_task_enabled(task)):
+            return candidates
+        shortlist = self._final_shortlist(candidates)
+        outcomes = {}
+
+        # Visual evidence comes first: Qwen ranks the broad 25-frame safety
+        # pool. DeepSeek then reasons only over the strongest 15 candidates,
+        # reducing prompt size without choosing its input from local rank alone.
+        deepseek_input = shortlist[: self._settings.deepseek_rerank_candidate_limit]
+        if self._qwen_task_enabled(task):
+            qwen_outcome = self._qwen_reranker.rerank(
+                task,
+                query,
+                shortlist,
+                candidate_limit=self._settings.qwen_rerank_candidate_limit,
+                timeout=getattr(self._settings, f"qwen_rerank_{task}_timeout_seconds"),
+            )
+            outcomes["qwen"] = qwen_outcome
+            if qwen_outcome.applied:
+                deepseek_input = qwen_outcome.candidates[
+                    : self._settings.deepseek_rerank_candidate_limit
+                ]
+
+        if deepseek_enabled:
+            outcomes["deepseek"] = self._deepseek_reranker.rerank(
+                task,
+                query,
+                deepseek_input,
+                candidate_limit=self._settings.deepseek_rerank_candidate_limit,
+                timeout=getattr(self._settings, f"deepseek_rerank_{task}_timeout_seconds"),
+            )
+        for name, outcome in outcomes.items():
+            logger.info(f"{name} {task} rerank {outcome.reason} in {outcome.latency_ms:.1f}ms")
+
+        weights = {"local": 1.0, "qwen": 1.2, "deepseek": 0.9}
+        rank_maps = {
+            "local": {self._candidate_key(row): rank for rank, row in enumerate(shortlist, 1)}
+        }
+        merged = {self._candidate_key(row): dict(row) for row in shortlist}
+        for name, outcome in outcomes.items():
+            if not outcome.applied:
+                continue
+            rank_maps[name] = {}
+            for rank, row in enumerate(outcome.candidates[:len(shortlist)], 1):
+                key = self._candidate_key(row)
+                rank_maps[name][key] = rank
+                merged[key].update({field: value for field, value in row.items() if field.startswith(name)})
+        scored = []
+        for key, row in merged.items():
+            score = sum(weights[name] / (10.0 + ranks[key]) for name, ranks in rank_maps.items() if key in ranks)
+            row["final_fusion_score"] = round(score, 6)
+            row["rerank_sources"] = list(rank_maps)
+            scored.append(row)
+        scored.sort(key=lambda row: row["final_fusion_score"], reverse=True)
+        # Final critics only inspect a bounded shortlist. Preserve the wider
+        # retrieval tail so an API request for 50 results does not silently
+        # collapse back to the 25-frame critic pool.
+        seen = {self._candidate_key(row) for row in scored}
+        tail = []
+        for candidate in candidates:
+            key = self._candidate_key(candidate)
+            if key in seen:
+                continue
+            row = dict(candidate)
+            row["rerank_sources"] = ["retrieval_tail"]
+            tail.append(row)
+            seen.add(key)
+        scored.extend(tail)
+        for rank, row in enumerate(scored, 1):
+            row["rank"] = rank
+        return scored
+
+    def _deepseek_task_enabled(self, task: str) -> bool:
+        return bool(
+            getattr(self, "_deepseek_reranker", None) is not None
+            and getattr(self._settings, f"deepseek_rerank_{task}_enabled", False)
+        )
+
+    def _deepseek_rerank(
+        self,
+        task: str,
+        query: str,
+        candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Apply the final reasoning layer without making it a dependency.
+
+        QA deliberately uses the QA evidence-ranking prompt and still returns
+        the same frame list as KIS; DeepSeek never generates an answer.
+        """
+        if not self._deepseek_task_enabled(task):
+            return candidates
+        timeout = getattr(
+            self._settings, f"deepseek_rerank_{task}_timeout_seconds"
+        )
+        outcome = self._deepseek_reranker.rerank(
+            task,
+            query,
+            candidates,
+            candidate_limit=self._settings.deepseek_rerank_candidate_limit,
+            timeout=timeout,
+        )
+        logger.info(
+            f"DeepSeek {task} rerank {outcome.reason} in "
+            f"{outcome.latency_ms:.1f}ms ({len(candidates)} candidates)"
+        )
+        return outcome.candidates
+
+    def _format_results(
+        self, results: List[FusedResult], query: str
+    ) -> List[Dict[str, Any]]:
+        """Format FusedResult objects into API response dicts."""
+        output = []
+        for r in results:
+            frame_path = self._resolve_frame_path(r.video_id, r.frame_id)
+
+            # Get video metadata (URL, duration)
+            video_meta = self._rm.load_video_metadata()
+            vid_info = video_meta.get(r.video_id, {})
+
+            # Get audio segment text for this frame
+            # Semantic ASR hits already carry the exact BGE-M3 segment text.
+            # Fall back to the legacy per-video metadata lookup only for
+            # visual-only results that have no ASR signal attached.
+            audio_text = r.audio_segment_text or self._get_audio_text_for_frame(
+                r.video_id, r.frame_id
+            )
+
+            output.append({
+                "video_id": r.video_id,
+                "frame_id": r.frame_id,
+                "frame_path": str(frame_path) if frame_path else "",
+                "frame_exists": frame_path is not None,
+                "score": round(r.rrf_score, 4),
+                "visual_score": round(r.visual_score, 4),
+                "audio_score": round(r.audio_score, 4),
+                "ocr_score": round(r.ocr_score, 4),
+                "caption_score": round(r.caption_score, 4),
+                "graph_score": round(r.graph_score, 4),
+                "visual_model_scores": {
+                    name: round(score, 4)
+                    for name, score in r.visual_model_scores.items()
+                },
+                "fusion_breakdown": {
+                    name: round(score, 6)
+                    for name, score in r.fusion_breakdown.items()
+                },
+                "rank": r.rank,
+                "audio_segment_text": audio_text,
+                "ocr_snippet": r.ocr_snippet,
+                "caption_snippet": r.caption_snippet,
+                "graph_snippet": r.graph_snippet,
+                "watch_url": vid_info.get("watch_url", ""),
+                "duration": vid_info.get("duration", 0),
+                "timestamp_seconds": round(
+                    r.frame_id / self._rm.get_video_fps(r.video_id), 1
+                ),
+            })
+        return output
+
+    def _get_audio_text_for_frame(
+        self, video_id: str, frame_id: int
+    ) -> str:
+        """Get ASR text segment closest to the given frame."""
+        try:
+            audio_meta = self._rm.load_audio_metadata()
+            segments = audio_meta.get(video_id, {}).get("segments", [])
+            if not segments:
+                return ""
+            time_sec = frame_id / self._rm.get_video_fps(video_id)
+            closest = min(
+                segments,
+                key=lambda s: abs(s.get("start", 0) - time_sec)
+            )
+            return closest.get("text_en", closest.get("text_vi", ""))
+        except Exception:
+            return ""
+
+    def get_video_fps(self, video_id: str) -> float:
+        """Native FPS for a video, for frame_id <-> timestamp conversion."""
+        return self._rm.get_video_fps(video_id)
+
+    def get_video_frame_timeline(
+        self, video_id: str, view: str = "boundaries"
+    ) -> List[Dict[str, Any]]:
+        """Return searchable keyframes and metadata-derived timestamps.
+
+        The active PE-Core frame sidecar is also the common reduce manifest
+        used by the visual rankers.  Build only compact row ranges once, then
+        materialize the requested video's frames without scanning or copying
+        all 1M+ ids on every right-click in the frontend.
+        """
+        if view not in {"boundaries", "all"}:
+            raise ValueError("view must be 'boundaries' or 'all'")
+        if view == "boundaries":
+            event_index = self._hybrid._get_kcp_event_index()
+            fps = float(self._rm.get_video_fps(video_id))
+            if fps <= 0:
+                raise ValueError(f"invalid metadata FPS for {video_id}")
+            boundaries: List[Dict[str, Any]] = []
+            for event_id, frames in event_index.ordered_events(video_id):
+                if not frames:
+                    continue
+                start_frame, end_frame = int(frames[0]), int(frames[-1])
+                boundaries.append({
+                    "frame_id": start_frame,
+                    "timestamp_seconds": round(start_frame / fps, 3),
+                    "event_id": str(event_id),
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "is_boundary": True,
+                })
+            if boundaries:
+                return boundaries
+
+        frame_keys = self._rm.load_frame_ids()
+        range_cache = getattr(self, "_ui_video_frame_ranges", None)
+        if not isinstance(range_cache, dict) or (
+            range_cache.get("source_id") != id(frame_keys)
+        ):
+            ranges: Dict[str, List[tuple]] = {}
+            previous_video = None
+            range_start = 0
+            for row, frame_key in enumerate(frame_keys):
+                video = str(frame_key).rsplit("_", 1)[0]
+                if previous_video is None:
+                    previous_video, range_start = video, row
+                elif video != previous_video:
+                    ranges.setdefault(previous_video, []).append(
+                        (range_start, row)
+                    )
+                    previous_video, range_start = video, row
+            if previous_video is not None:
+                ranges.setdefault(previous_video, []).append(
+                    (range_start, len(frame_keys))
+                )
+            range_cache = {"source_id": id(frame_keys), "ranges": ranges}
+            self._ui_video_frame_ranges = range_cache
+
+        fps = float(self._rm.get_video_fps(video_id))
+        if fps <= 0:
+            raise ValueError(f"invalid metadata FPS for {video_id}")
+        timeline: List[Dict[str, Any]] = []
+        for start, end in range_cache["ranges"].get(video_id, []):
+            for frame_key in frame_keys[start:end]:
+                try:
+                    frame_id = int(str(frame_key).rsplit("_", 1)[1])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                timeline.append({
+                    "frame_id": frame_id,
+                    "timestamp_seconds": round(frame_id / fps, 3),
+                })
+        return timeline
+
+    def get_frame_path(self, video_id: str, frame_id: int) -> Optional[Path]:
+        """Real keyframe JPEG path for (video_id, frame_id)."""
+        return self._resolve_frame_path(video_id, frame_id)
+
+    def _resolve_frame_path(self, video_id: str, frame_id: int) -> Path:
+        """Prefer the real batch1 manifest-mapped keyframe JPEG; fall back
+        to the legacy flat convention for any pipeline that writes frames
+        that way instead."""
+        manifest_path = self._rm.get_frame_path(video_id, frame_id)
+        if manifest_path is not None and manifest_path.exists():
+            return manifest_path
+        legacy_path = self._settings.frames_dir / video_id / f"{frame_id:05d}.jpg"
+        if legacy_path.exists():
+            return legacy_path
+        # Do not expose a fabricated path when frame JPEG extraction is absent.
+        return None
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return engine statistics."""
+        hybrid = getattr(self, "_hybrid", None)
+        broad_shortlist = list(getattr(
+            hybrid, "_last_deep_video_shortlist", []
+        ) or [])
+        local_shortlist = list(getattr(
+            hybrid, "_last_deep_video_local_shortlist", []
+        ) or [])
+        return {
+            "query_count": self._query_count,
+            "cache_stats": get_query_cache().get_stats(),
+            "deepseek_rerank": (
+                self._deepseek_reranker.stats()
+                if getattr(self, "_deepseek_reranker", None) is not None
+                else {"enabled": False}
+            ),
+            "qwen_rerank": (
+                self._qwen_reranker.stats()
+                if getattr(self, "_qwen_reranker", None) is not None
+                else {"enabled": False}
+            ),
+            "deepseek_vision": {
+                "enabled": self._deepseek_vision_reranker is not None,
+                "model": self._settings.deepseek_vision_model,
+                "per_request_default": False,
+            },
+            # GT-free observability for the explicit Lock-Video experiment.
+            # This is intentionally only the last request's video IDs; it
+            # allows shortlist-recall auditing without exposing frame pools.
+            "video_lock": {
+                "shortlist_size": len(broad_shortlist),
+                "local_scope_size": len(local_shortlist),
+                "shortlist_video_ids": broad_shortlist[:100],
+                "local_scope_video_ids": local_shortlist[:100],
+            },
+        }
+
+
+# Singleton instance
+_engine: Optional[SearchEngine] = None
+
+
+def get_search_engine() -> SearchEngine:
+    """Get or create the singleton SearchEngine."""
+    global _engine
+    if _engine is None:
+        _engine = SearchEngine()
+    return _engine

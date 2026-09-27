@@ -1,0 +1,134 @@
+"""OpenCLIP implementation of SigLIP2 for :class:`VisualTextEncoder`.
+
+Loads Google's SigLIP2 checkpoints via the same pip-installed ``open_clip``
+package already used by :class:`~src.encoders.pe_core_encoder.PECoreEncoder`
+(open-clip-torch>=3.0.0 ships native ``*-SigLIP2*`` pretrained tags backed by
+``webli`` weights — no ``hf-hub:`` remap needed, unlike PE-Core). This keeps
+every encoder in the pipeline on one loading path
+(``open_clip.create_model_and_transforms`` + ``encode_image(..., normalize=True)``
+/ ``encode_text(..., normalize=True)``) instead of mixing in a second
+``transformers``-based SigLIP2 implementation.
+
+Default checkpoint is the "SO400M/14" scale at its highest open_clip
+resolution (1152-dim, 378px) — user choice, made deliberately over the
+lighter B/16 scale despite this being the THIRD visual encoder added at
+query time on top of PE-Core-L-14-336 and BEiT-3-large: prioritizes result
+quality over per-query latency. Note open_clip's patch14 SO400M tag is
+suffixed "-378", not "-384" (that suffix is reserved for the patch16 variant
+— see open_clip.list_pretrained()); this is still the flagship SigLIP2
+checkpoint, just at its own native highest resolution rather than 384.
+"""
+from typing import Any, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+from loguru import logger
+
+from src.encoders.base import VisualTextEncoder
+
+#: "SO400M/14" scale (1152-dim, 378px) — see module docstring for the
+#: latency/quality tradeoff and the "-378" vs "-384" naming note.
+DEFAULT_SIGLIP2_MODEL_ID = "ViT-SO400M-14-SigLIP2-378"
+DEFAULT_SIGLIP2_PRETRAINED = "webli"
+
+
+class SigLIP2Encoder(VisualTextEncoder):
+    """Lazy-loading SigLIP2 dual encoder via open_clip."""
+
+    encoder_type = "siglip2"
+
+    def __init__(
+        self,
+        model_id: str = DEFAULT_SIGLIP2_MODEL_ID,
+        pretrained: str = DEFAULT_SIGLIP2_PRETRAINED,
+        device: Optional[torch.device] = None,
+    ):
+        if not model_id.strip():
+            raise ValueError("model_id must be non-empty")
+        if not pretrained.strip():
+            raise ValueError("pretrained must be non-empty")
+        self._model_id = model_id
+        self._pretrained = pretrained
+        self._device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self._model = None
+        self._preprocess = None
+        self._tokenizer = None
+        self._embedding_dim: Optional[int] = None
+
+    @property
+    def checkpoint(self) -> str:
+        return f"{self._model_id}|pretrained={self._pretrained}"
+
+    @property
+    def embedding_dim(self) -> int:
+        self._load()
+        return self._embedding_dim
+
+    def _load(self) -> Tuple[Any, Any, Any]:
+        if self._model is not None:
+            return self._model, self._preprocess, self._tokenizer
+
+        try:
+            import open_clip
+        except ImportError as e:
+            raise ImportError(
+                f"open_clip missing or too old ({e}). SigLIP2 requires "
+                "open-clip-torch>=3.0.0: pip install -U open-clip-torch"
+            ) from e
+
+        logger.info(
+            f"Loading SigLIP2 model: {self._model_id} (pretrained={self._pretrained})"
+        )
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            self._model_id, pretrained=self._pretrained
+        )
+        # Keep the text tower in FP32 on CUDA.  The persisted visual vectors
+        # were produced in FP32 and FP16 query embeddings can perturb cosine
+        # scores enough to reorder tightly clustered frames before RRF/KCP.
+        # GPU FP32 retains acceleration while matching the index precision.
+        if str(self._device).startswith("cuda") and hasattr(model, "text"):
+            model.text = model.text.to(self._device)
+            self._text_device = self._device
+        else:
+            model = model.to(self._device)
+            self._text_device = self._device
+        model.eval()
+        tokenizer = open_clip.get_tokenizer(self._model_id)
+
+        self._model = model
+        self._preprocess = preprocess
+        self._tokenizer = tokenizer
+
+        # Same rationale as PECoreEncoder._load: don't trust a model-internal
+        # attribute name for the embedding dim across open_clip model
+        # classes; infer it from a real encode call instead.
+        with torch.no_grad():
+            probe = model.encode_text(tokenizer(["warmup"]).to(self._text_device))
+        self._embedding_dim = int(probe.shape[-1])
+        logger.info(
+            f"SigLIP2 loaded on {self._device}, "
+            f"embedding_dim={self._embedding_dim}"
+        )
+        return self._model, self._preprocess, self._tokenizer
+
+    def encode_images(self, images: Sequence[Any]) -> np.ndarray:
+        model, preprocess, _ = self._load()
+        visual_device = next(model.visual.parameters()).device
+        visual_dtype = next(model.visual.parameters()).dtype
+        batch = torch.stack(
+            [preprocess(image.convert("RGB")) for image in images]
+        ).to(visual_device, dtype=visual_dtype)
+        with torch.no_grad():
+            feats = model.encode_image(batch, normalize=True)
+        return feats.float().cpu().numpy().astype(np.float32)
+
+    def encode_texts(self, texts: Sequence[str]) -> np.ndarray:
+        model, _, tokenizer = self._load()
+        tokens = tokenizer(
+            list(texts), context_length=model.context_length
+        ).to(self._text_device)
+        with torch.no_grad():
+            feats = model.encode_text(tokens, normalize=True)
+        return feats.float().cpu().numpy().astype(np.float32)

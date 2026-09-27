@@ -1,0 +1,178 @@
+"""Small read-only Typesense client shared by OCR, ASR and caption lanes."""
+
+from __future__ import annotations
+
+import json
+import os
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Sequence
+
+
+def normalize_lexical(value: object) -> str:
+    text = " ".join(unicodedata.normalize("NFC", str(value or "")).casefold().split())
+    text = "".join(
+        char
+        for char in unicodedata.normalize("NFD", text)
+        if unicodedata.category(char) != "Mn"
+    )
+    return text.replace("đ", "d")
+
+
+class TypesenseRuntime:
+    """HTTP-only Typesense search client; it never mutates collections."""
+
+    def __init__(
+        self,
+        *,
+        url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout_seconds: float = 15.0,
+        ef: int = 100,
+    ) -> None:
+        protocol = os.environ.get("TYPESENSE_PROTOCOL", "http")
+        host = os.environ.get("TYPESENSE_HOST", "127.0.0.1")
+        port = os.environ.get("TYPESENSE_PORT", "8108")
+        self.url = (url or os.environ.get("TYPESENSE_URL") or "%s://%s:%s" % (protocol, host, port)).rstrip("/")
+        self.api_key = api_key or os.environ.get("TYPESENSE_API_KEY") or ""
+        self.timeout_seconds = float(timeout_seconds)
+        self.ef = int(ef)
+        if not self.api_key:
+            raise ValueError("TYPESENSE_API_KEY is required")
+
+    def _request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        request = urllib.request.Request(
+            self.url + "/multi_search",
+            data=json.dumps({"searches": [payload]}).encode("utf-8"),
+            method="POST",
+            headers={
+                "X-TYPESENSE-API-KEY": self.api_key,
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                value = json.load(response)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                "Typesense search failed: HTTP %d: %s" % (error.code, detail)
+            ) from error
+        if not isinstance(value, dict) or not value.get("results"):
+            raise RuntimeError("Typesense returned an invalid multi_search response")
+        result = value["results"][0]
+        if not isinstance(result, dict):
+            raise RuntimeError("Typesense search result is not an object")
+        if result.get("error"):
+            raise RuntimeError("Typesense search failed: %s" % result["error"])
+        return result
+
+    @staticmethod
+    def _score(hit: Dict[str, Any], rank: int) -> float:
+        distance = hit.get("vector_distance")
+        if distance is not None:
+            try:
+                return max(0.0, min(1.0, 1.0 - float(distance)))
+            except (TypeError, ValueError):
+                pass
+        text_match = hit.get("text_match")
+        if text_match is not None:
+            try:
+                return 1.0 / max(1.0, float(rank))
+            except (TypeError, ValueError):
+                pass
+        return 1.0 / max(1.0, float(rank))
+
+    def search(
+        self,
+        *,
+        collection: str,
+        query: str,
+        query_by: str,
+        mode: str,
+        top_k: int,
+        vector: Optional[Sequence[float]] = None,
+        filter_by: Optional[str] = None,
+        alpha: float = 0.70,
+        ef: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if mode not in {"lexical", "semantic", "hybrid"}:
+            raise ValueError("unsupported Typesense mode: %s" % mode)
+        if top_k <= 0:
+            return []
+        effective_ef = int(self.ef if ef is None else ef)
+        request: Dict[str, Any] = {
+            "collection": collection,
+            "q": normalize_lexical(query) if mode != "semantic" else "*",
+            "per_page": int(top_k),
+            "exclude_fields": "embedding",
+        }
+        if filter_by:
+            request["filter_by"] = filter_by
+        if mode in {"lexical", "hybrid"}:
+            request.update({"query_by": query_by, "drop_tokens_threshold": 0})
+        if mode in {"semantic", "hybrid"}:
+            if vector is None:
+                raise ValueError("%s Typesense search requires a query vector" % mode)
+            values = ",".join(str(float(value)) for value in vector)
+            if mode == "semantic":
+                request["vector_query"] = "embedding:([%s],k:%d,ef:%d)" % (
+                    values, int(top_k), effective_ef
+                )
+            else:
+                request["vector_query"] = "embedding:([%s],alpha:%s,ef:%d)" % (
+                    values, float(alpha), effective_ef
+                )
+                request["rerank_hybrid_matches"] = True
+        result = self._request(request)
+        output: List[Dict[str, Any]] = []
+        for rank, hit in enumerate(result.get("hits", []), 1):
+            document = hit.get("document", {})
+            if not isinstance(document, dict):
+                continue
+            row = dict(document)
+            row["_rank"] = rank
+            row["_score"] = self._score(hit, rank)
+            if hit.get("vector_distance") is not None:
+                row["_vector_distance"] = float(hit["vector_distance"])
+            output.append(row)
+        return output
+
+    def search_ocr(
+        self, collection: str, query: str, mode: str, top_k: int,
+        vector: Optional[Sequence[float]], alpha: float,
+    ) -> List[Dict[str, Any]]:
+        return self.search(
+            collection=collection, query=query,
+            query_by="normalized,raw_text", mode=mode,
+            top_k=top_k, vector=vector, alpha=alpha,
+        )
+
+    def search_asr(
+        self, collection: str, query: str, mode: str, top_k: int,
+        vector: Optional[Sequence[float]], alpha: float,
+        granularity: str,
+    ) -> List[Dict[str, Any]]:
+        return self.search(
+            collection=collection, query=query,
+            query_by="normalized,text", mode=mode,
+            top_k=top_k, vector=vector, alpha=alpha,
+            filter_by="granularity:=%s" % granularity,
+        )
+
+    def search_caption(
+        self, collection: str, query: str, mode: str, top_k: int,
+        vector: Optional[Sequence[float]], alpha: float,
+    ) -> List[Dict[str, Any]]:
+        return self.search(
+            collection=collection, query=query,
+            query_by=(
+                "normalized,full_text,visual_description,actions,scene,"
+                "visible_text,spoken_summary,entities"
+            ), mode=mode, top_k=top_k, vector=vector, alpha=alpha,
+        )
+
+
+__all__ = ["TypesenseRuntime", "normalize_lexical"]

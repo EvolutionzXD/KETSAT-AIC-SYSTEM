@@ -1,0 +1,144 @@
+/* DRES login modal — see src/scripts/submit_dres.js::openDresLoginModal.
+   Uses the same tokens as layout.css (--primary-color/--card-background). */
+
+#dres-login-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dres-modal-card {
+  background: var(--card-background, #fff);
+  border-radius: 12px;
+  padding: 28px;
+  width: 320px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.25);
+  font-family: inherit;
+}
+
+.dres-modal-card h3 {
+  margin: 0 0 18px;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-color, #333);
+}
+
+.dres-modal-card input,
+.dres-modal-card select {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border-color, #d8dce3);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--text-color, #333);
+  background: var(--bg-3, #fff);
+  transition: border-color 0.15s ease;
+}
+
+.dres-modal-card input:focus,
+.dres-modal-card select:focus {
+  outline: none;
+  border-color: var(--primary-color, #3a7bd5);
+  box-shadow: 0 0 0 3px rgba(139, 107, 255, 0.25);
+}
+
+.dres-modal-buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.dres-modal-buttons button {
+  flex: 1;
+  padding: 9px 14px;
+  border-radius: 8px;
+  border: none;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease, transform 0.05s ease;
+}
+
+.dres-modal-buttons button:active {
+  transform: scale(0.98);
+}
+
+#dres-login-submit,
+#dres-evaluation-confirm {
+  background: var(--primary-color, #3a7bd5);
+  color: #fff;
+}
+
+#dres-login-submit:hover,
+#dres-evaluation-confirm:hover {
+  opacity: 0.9;
+}
+
+#dres-login-cancel {
+  background: var(--secondary-color, #eef0f3);
+  color: var(--secondary-text, #444);
+}
+
+#dres-login-cancel:hover {
+  background: var(--secondary-color-hover, #e2e5ea);
+}
+
+.dres-evaluation-picker {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color, #eee);
+}
+
+.dres-evaluation-picker p {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-md, #666);
+}
+
+.dres-status-line {
+  margin: 0 0 14px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.dres-status-line.ok {
+  background: rgba(34, 197, 94, 0.12);
+  color: #16a34a;
+}
+
+.dres-status-line.neutral {
+  background: var(--bg-3, #eef0f3);
+  color: var(--text-md, #666);
+}
+
+.dres-field-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-md, #666);
+  margin: 0 0 4px;
+}
+
+.dres-logout-button {
+  background: rgba(239, 68, 68, 0.12) !important;
+  color: #dc2626 !important;
+}
+
+.dres-logout-button:hover {
+  opacity: 0.85;
+}
+
+/* Header DRES button — persistent logged-in indicator (see
+   src/scripts/submit_dres.js::updateDresLoginButton). */
+#dres-login-button.dres-logged-in {
+  color: #22c55e;
+  border-color: #22c55e;
+}

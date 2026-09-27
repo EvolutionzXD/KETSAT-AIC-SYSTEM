@@ -1,0 +1,667 @@
+"""Configuration management using pydantic-settings."""
+from functools import lru_cache
+from pathlib import Path
+from typing import List, Literal, Optional
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from src.encoders.pe_core_encoder import DEFAULT_PE_CORE_MODEL_ID
+from src.encoders.jina_v5_omni_encoder import DEFAULT_JINA_V5_OMNI_MODEL_ID
+from src.encoders.siglip2_encoder import (
+    DEFAULT_SIGLIP2_MODEL_ID,
+    DEFAULT_SIGLIP2_PRETRAINED,
+)
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_nested_delimiter="__",
+        case_sensitive=False,
+    )
+
+    # Hardware
+    device: str = Field(default="cpu", description="Device: 'cuda' or 'cpu'")
+    # Optional per-encoder devices in the CUDA_VISIBLE_DEVICES namespace.
+    # None preserves the legacy layout: PE-Core and SigLIP2 on cuda:0,
+    # BEiT-3 on cuda:1 when at least two GPUs are visible.
+    pe_core_device: Optional[str] = Field(default=None)
+    siglip2_device: Optional[str] = Field(default=None)
+    beit3_device: Optional[str] = Field(default=None)
+    # Optional Jina v5 Omni query encoder. It follows the same visible CUDA
+    # namespace as the other model devices. Production enables it explicitly
+    # in api.env after staging the validated common-reduce artifact.
+    jina_v5_device: Optional[str] = Field(default=None)
+
+    # Paths
+    data_root: Path = Field(default=Path("./data"))
+    catalog_path: Path = Field(default=Path("./data/catalog/aic2026.sqlite"))
+    pe_core_index_alias: str = Field(default="visual.pe_core.primary")
+    beit3_index_alias: str = Field(default="visual.beit3.primary")
+    siglip2_index_alias: str = Field(default="visual.siglip2.primary")
+    catalog_verify_artifact_checksums: bool = Field(default=True)
+    # UIT runtime must set this true after staging the immutable catalog under
+    # /dev/shm. It is false locally so Windows/development fixtures remain valid.
+    catalog_require_tmpfs: bool = Field(default=False)
+    # Legacy flat convention (frames_dir/video_id/{frame_id:05d}.jpg) — kept
+    # as a fallback for any pipeline that writes frames this way; batch1
+    # does not (see frame_manifests_dir below).
+    frames_dir: Path = Field(default=Path("./data/frames"))
+    # Real batch1 keyframe JPEGs live under a candidate-extraction tree
+    # keyed by a hashed video_uid, not video_id — e.g.
+    # <frame_candidates_root>/frames/<video_uid>/<fingerprint>/00000005.jpg.
+    # Each `frame_manifests_dir/<video_uid>.json` records the mapping
+    # (video_id, candidate_frame_dir relative to frame_candidates_root,
+    # candidate_image_pattern "{original_frame_idx:08d}.jpg"). Both None
+    # disables this lookup (frame_exists stays false, matching the old
+    # behavior when this data isn't available).
+    frame_manifests_dir: Optional[Path] = Field(default=None)
+    frame_candidates_root: Optional[Path] = Field(default=None)
+    # Source .mp4 files, one per video_id (e.g. videos_dir/L21_V001.mp4),
+    # served raw via GET /api/videos/{video_id} for <video> playback
+    # (FileResponse handles Range headers, so no HLS segmentation needed).
+    # None disables the route (404).
+    videos_dir: Optional[Path] = Field(default=None)
+    features_dir: Path = Field(default=Path("./data/features"))
+    audio_metadata_path: Path = Field(default=Path("./data/index/audio_metadata.json"))
+    audio_faiss_index_path: Path = Field(default=Path("./data/index/audio_index.faiss"))
+    # Optional VTG grounding service used only by explicit video_lock mode.
+    vtg_grounding_enabled: bool = Field(default=False)
+    vtg_ground_service_url: str = Field(default="http://127.0.0.1:8610")
+    vtg_ground_timeout_seconds: float = Field(default=90.0, gt=0)
+    # Lock-Video+VTG is a refinement branch.  The coarse retrieval is built
+    # once by the search engine, then only its top KCP-backed moments are sent
+    # to the persistent VTG service.  These bounds keep the optional branch
+    # predictable without changing Standard/Multi-mode defaults.
+    vtg_seed_moment_limit: int = Field(default=30, ge=1, le=100)
+    vtg_max_windows: int = Field(default=30, ge=1, le=100)
+    vtg_top_k_per_window: int = Field(default=3, ge=1, le=20)
+    vtg_frames_per_proposal: int = Field(default=5, ge=1, le=9)
+    vtg_candidate_limit: int = Field(default=120, ge=1, le=600)
+    vtg_seed_window_frames: int = Field(default=300, ge=30, le=5000)
+    # Semantic ASR search over 20s-segment BGE-M3 embeddings (see
+    # scripts/build_asr_bge_index.py) — a finer-grained, dense-retrieval
+    # replacement for the one-vector-per-video path above. Both optional
+    # (None = feature off): if either is missing, search_audio() falls
+    # back to returning no hits for this signal rather than raising, same
+    # as every other optional modality.
+    asr_bge_index_path: Optional[Path] = Field(default=None)
+    asr_bge_segments_path: Optional[Path] = Field(default=None)
+    # Optional sentence-level BGE-M3 ASR view.  The coarse index above keeps
+    # the original 20-second segments for recall; when this flag is enabled,
+    # search_audio() prefers the sentence view (median span ~8 seconds) and
+    # falls back to the coarse pair if either fine artifact is unavailable.
+    asr_bge_fine_index_path: Optional[Path] = Field(default=None)
+    asr_bge_fine_segments_path: Optional[Path] = Field(default=None)
+    asr_bge_prefer_fine: bool = Field(default=False)
+    # Conservative ASR query routing remains the standard-path behavior.
+    # Multi-mode visual+ASR explicitly opts into the user's original wording
+    # (only Unicode and whitespace normalization) at the call site.
+    asr_query_routing_enabled: bool = Field(default=True)
+    asr_direct_query_enabled: bool = Field(default=False)
+    asr_bge_model_name: str = Field(default="BAAI/bge-m3")
+    asr_bge_device: str = Field(default="cpu")
+    asr_bge_use_fp16: bool = Field(default=False)
+    # PE-Core visual retrieval backend: "faiss" (default, local index file —
+    # see docker/api/Dockerfile.withdata's header for why this needs to be
+    # baked into the image or bind-mounted carefully on this host) or
+    # "milvus" (query a live Milvus collection instead — no local index
+    # file needed at all, sidesteps that whole bind-mount/bake problem).
+    # A team ingestion job is migrating the same PE-Core vectors from the
+    # FAISS index into Milvus collection "pecore_frames" (frame_id_str,
+    # video_id, frame_number, vector[1024], metric_type COSINE — verified
+    # against the live collection 2026-08-13, matches this FAISS index's
+    # IndexFlatIP-on-L2-normalized-vectors exactly). Switch this once that
+    # ingestion finishes; until then leave it "faiss".
+    visual_index_backend: Literal["faiss", "milvus", "qdrant"] = Field(default="qdrant")
+    milvus_host: str = Field(default="milvus")
+    milvus_port: str = Field(default="19530")
+    milvus_pecore_collection: str = Field(default="pecore_frames")
+    qdrant_url: str = Field(default="http://127.0.0.1:16333")
+    qdrant_client_vendor: str = Field(
+        default="/home/bachdx/Final_AIC/backend/vendor/python"
+    )
+    # Explicit local runtime roots accepted from Final_AIC/.env.  The runner
+    # exports these before importing model libraries so no global cache or
+    # vendor directory is required.
+    qdrant_client_vendor_path: Optional[Path] = Field(default=None)
+    hf_home: Optional[Path] = Field(default=None)
+    huggingface_hub_cache: Optional[Path] = Field(default=None)
+    transformers_cache: Optional[Path] = Field(default=None)
+    qdrant_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    qdrant_search_exact: bool = Field(default=True)
+    qdrant_hnsw_ef: int = Field(default=128, ge=1, le=10000)
+    qdrant_pe_core_collection: str = Field(default="aic_batch1_reduce_pe_core")
+    qdrant_beit3_collection: str = Field(default="aic_batch1_reduce_beit3")
+    qdrant_siglip2_collection: str = Field(default="aic_batch1_reduce_siglip2")
+    qdrant_jina_v5_collection: str = Field(default="aic_batch1_reduce_jina_v5")
+    qdrant_visual_top_k: int = Field(default=100, ge=1, le=2000)
+
+    # Data paths
+    visual_faiss_index_path: Path = Field(default=Path("./data/index/visual_index.faiss"))
+    frame_ids_path: Path = Field(default=Path("./data/index/frame_ids.json"))
+    frame_mapping_path: Path = Field(default=Path("./data/index/frame_mapping.json"))
+    video_metadata_path: Path = Field(default=Path("./data/index/video_metadata.json"))
+    ocr_results_path: Optional[Path] = Field(default=Path("./data/index/ocr_results.json"))
+    # Server-side SOLOAI CSV export.  UIT sets this to /home/bachdx/SOLOAI.
+    soloai_output_dir: Path = Field(default=Path("./SOLOAI"))
+    # Optional BGE semantic OCR lane configured by the shared api.env.
+    ocr_semantic_index_path: Optional[Path] = Field(default=None)
+    ocr_semantic_metadata_path: Optional[Path] = Field(default=None)
+    # Full 615k frame-level OCR corpus.  Used as a read-only video-routing
+    # lane by the optional DeepSeek/Video-Lock slow path.
+    ocr_lexical_sqlite_path: Optional[Path] = Field(default=None)
+    # Keep RRF-equivalent local text retrieval as the safe production default.
+    # Typesense remains an explicit opt-in until its corpora and ranking have
+    # passed parity validation against the local artifacts.
+    text_index_backend: Literal["typesense", "local"] = Field(default="local")
+    typesense_url: str = Field(default="http://127.0.0.1:8108")
+    typesense_api_key: Optional[str] = Field(default=None)
+    typesense_timeout_seconds: float = Field(default=15.0, gt=0.0)
+    typesense_vector_ef: int = Field(default=100, ge=1)
+    # Runtime aliases are moved only after a versioned final collection passes
+    # audit and retrieval smoke tests.  They intentionally do not point at
+    # the old smoke collections or overwrite any Batch1 artifact.
+    typesense_ocr_collection: str = Field(default="ocr_frames_current")
+    typesense_asr_collection: str = Field(default="asr_segments_current")
+    typesense_asr_fine_collection: str = Field(default="asr_segments_current")
+    typesense_caption_collection: str = Field(default="caption_windows_current")
+    typesense_ocr_mode: Literal["lexical", "semantic", "hybrid"] = Field(default="hybrid")
+    typesense_asr_mode: Literal["lexical", "semantic", "hybrid"] = Field(default="hybrid")
+    typesense_caption_mode: Literal["lexical", "semantic", "hybrid"] = Field(default="hybrid")
+    typesense_ocr_alpha: float = Field(default=0.45, ge=0.0, le=1.0)
+    typesense_asr_alpha: float = Field(default=0.70, ge=0.0, le=1.0)
+    typesense_caption_alpha: float = Field(default=0.70, ge=0.0, le=1.0)
+    typesense_asr_granularity: Literal["coarse", "sentence", "scene"] = Field(default="sentence")
+    #: ocr_frame_map*.jsonl from scripts/select_ocr_frames.py. Without
+    #: these, only the ~13% of frames that were actually OCR-ed are
+    #: searchable; the rest inherit their text through this map.
+    ocr_frame_map_paths: List[Path] = Field(default_factory=list)
+    #: Merged output of scripts/merge_qwen_records.py: KCP-window records
+    #: keyed by record_id, each with start_seconds/end_seconds and a
+    #: 6-field structured description. Not the old flat per-frame
+    #: {"caption": str, "frame_id": int} shape — that format was never
+    #: populated with real data before the project moved to per-window
+    #: records (see docs/QWEN_SEMANTIC_RECORDS_PLAN.md).
+    qwen_semantic_records_path: Optional[Path] = Field(default=Path("./data/index/qwen_semantic_records.json"))
+    # Optional field-aware dense indexes over Qwen's structured records.
+    # The directory contains one FAISS index and JSON sidecar for each
+    # populated field: visual_description, actions and entities.
+    qwen_structured_index_dir: Optional[Path] = Field(default=None)
+    scene_graph_path: Optional[Path] = Field(default=Path("./data/index/scene_graph.json"))
+
+    # Models
+    # Defaults must match the encoder that built the deployed FAISS index
+    # (see index_metadata.json). PE-Core is the canonical visual retriever;
+    # plain CLIP is intentionally not configurable on the production path.
+    pe_core_model_id: str = Field(default=DEFAULT_PE_CORE_MODEL_ID)
+    text_embed_model_name: str = Field(default="vinai/phobert-large")
+    rerank_model_name: Optional[str] = Field(default=None)
+
+    # Main visual path: normalized score fusion across up to three visual
+    # granularities — PE-Core (broad), BEiT-3 (fine), and SigLIP2 (third
+    # opinion, own encoder family). Any encoder whose index/checkpoint isn't
+    # configured is simply left out of the fusion (see
+    # normalized_score_fusion), so the runtime degrades gracefully down to
+    # PE-Core-only when neither BEiT-3 nor SigLIP2 assets exist.
+    ensemble_enabled: bool = Field(default=True)
+    beit3_checkpoint: Optional[Path] = Field(default=None)
+    beit3_spm_path: Optional[Path] = Field(default=None)
+    beit3_lora_checkpoint: Optional[Path] = Field(default=None)
+    beit3_lora_strength: float = Field(default=1.0, ge=0.0)
+    beit3_model_name: str = Field(default="beit3_large_patch16_224_retrieval")
+    beit3_visual_index_dir: Optional[Path] = Field(default=None)
+    # SigLIP2 needs no local checkpoint (open_clip pulls "webli" weights from
+    # the HF hub, same as PE-Core) — only the built visual index has to be
+    # configured (catalog alias or siglip2_visual_index_dir) for it to join
+    # the ensemble.
+    siglip2_model_id: str = Field(default=DEFAULT_SIGLIP2_MODEL_ID)
+    siglip2_pretrained: str = Field(default=DEFAULT_SIGLIP2_PRETRAINED)
+    siglip2_visual_index_dir: Optional[Path] = Field(default=None)
+    # Jina v5 Omni visual index built by scripts/build_jina_faiss.py. The
+    # production view is the validated common reduction; set ``full`` only
+    # for an explicit ablation. Explicit paths override the directory
+    # convention.
+    jina_v5_enabled: bool = Field(default=False)
+    jina_v5_model_id: str = Field(default=DEFAULT_JINA_V5_OMNI_MODEL_ID)
+    jina_v5_visual_index_dir: Optional[Path] = Field(default=None)
+    jina_v5_visual_index_path: Optional[Path] = Field(default=None)
+    jina_v5_frame_ids_path: Optional[Path] = Field(default=None)
+    jina_v5_visual_view: Literal["reduce", "full"] = Field(default="reduce")
+    jina_v5_worker_url: Optional[str] = Field(default=None)
+    jina_v5_fp16: bool = Field(default=False)
+    jina_v5_truncate_dim: Optional[int] = Field(default=None, gt=0)
+    # Jina's packed vectors are normalized IP scores.  -1 keeps all valid
+    # hits; an explicit threshold can be enabled after an offline ablation.
+    jina_v5_score_threshold: float = Field(default=-1.0)
+    ensemble_top_m: int = Field(default=50)
+    # Per-encoder fusion weights. These are RAW contributions, not required
+    # to sum to 1 — normalized_score_fusion renormalizes over whichever
+    # encoders are actually available for a given query (see
+    # src/search/multi_granularity.py::normalize_weights), so leaving
+    # siglip2's default equal to the other two only takes effect once a
+    # SigLIP2 index is actually configured; with just PE-Core+BEiT-3 (the
+    # pre-SigLIP2 default), the 0.5/0.5 ratio here reproduces the exact
+    # prior 2-way behavior.
+    # Legacy normalized-score ensemble only.  Equal raw weights are
+    # intentional: normalized_score_fusion renormalizes over available
+    # encoders, while production KIS uses the separate weighted-RRF lanes
+    # below.  Jina is not given a special bonus without a held-out proof.
+    ensemble_pe_core_weight: float = Field(default=0.25, ge=0.0)
+    ensemble_beit3_weight: float = Field(default=0.25, ge=0.0)
+    ensemble_siglip2_weight: float = Field(default=0.25, ge=0.0)
+    ensemble_jina_v5_weight: float = Field(default=0.25, ge=0.0)
+
+    # Optional visual clause-recall branch.  The normal full-query visual
+    # ranking remains the default; when enabled, only explicit independent
+    # clauses are probed as a bounded recall escape and the strongest full
+    # query results are protected inside each visual lane.  This is kept off
+    # until the batch1/batch2 KIS+QA ablation passes without regression.
+    rrf_visual_clause_union_enabled: bool = Field(default=False)
+    rrf_visual_clause_max: int = Field(default=3, ge=1, le=5)
+    rrf_visual_clause_candidate_limit: int = Field(default=500, ge=50, le=2000)
+    rrf_visual_clause_protect_top_n: int = Field(default=20, ge=0, le=100)
+
+    # Search config
+    default_top_k: int = Field(default=20)
+    max_results_per_video: int = Field(default=3)
+    fusion_method: Literal["rrf"] = Field(default="rrf")
+    # KIS hybrid fusion uses a smaller k so a specialist's top ranks retain
+    # meaning (validated manually by the team: k=10 was materially better
+    # than the old k=60 on the competition-style query set).
+    # Backend-RRF contract validated by the 2026-08-25 offline replay.
+    # k=30 preserves useful deep evidence without flattening the visual head.
+    rrf_k: int = Field(default=30)
+    # Per-ranker RRF weight for the static (non-query-adaptive) path — what
+    # actually runs by default, since query_adaptive_rrf_enabled is off.
+    # 2026-08-10 live eye-checked queries: with visual/OCR both tightened
+    # (visual cross-model corroboration, OCR phrase-adjacency bonus — see
+    # their own settings below) caption's own ranking was left untouched, so
+    # it started winning rank 1 on queries with no real caption-specific
+    # relevance, simply because equal-weight RRF has no way to reward the
+    # OTHER four rankers agreeing more narrowly. Matches earlier evidence:
+    # the 2026-07-29 UIT-OpenViIC eval already found equal-weight caption
+    # dragged R@1 from 56.3% (visual-only) to 40.3% (see caption_rank_cutoff
+    # below). Caption stays informative for the ~18% of frames it covers —
+    # this only rebalances how much it can outweigh the other four when it
+    # disagrees with them, not remove it.
+    visual_rrf_weight: float = Field(default=2.0)
+    caption_rrf_weight: float = Field(default=1.25)
+    audio_rrf_weight: float = Field(default=1.0)
+    ocr_rrf_weight: float = Field(default=1.0)
+    # Semantic OCR is a separate BGE-M3 opinion.  Keep its weight explicit so
+    # deployments can tune it without changing the lexical OCR contract.
+    ocr_semantic_rrf_weight: float = Field(default=1.0, ge=0.0)
+    pe_core_rrf_weight: float = Field(default=2.0)
+    beit3_rrf_weight: float = Field(default=2.0)
+    siglip2_rrf_weight: float = Field(default=2.0)
+    # Jina v5 is a fourth visual opinion in the opt-in path.  Keep its RRF
+    # contribution in the same unit as the existing visual lanes; enabling
+    # the lane has no effect while JINA_V5_ENABLED=false.
+    jina_v5_rrf_weight: float = Field(default=2.0, ge=0.0)
+    # Optional, feature-gated BEiT-3 regional lane.  It is consulted only
+    # when the query explicitly asks for an absolute image region (for
+    # example "top-left of the frame"); full-frame FAISS remains primary.
+    spatial_qdrant_enabled: bool = Field(default=False)
+    spatial_qdrant_host: str = Field(default="127.0.0.1")
+    spatial_qdrant_rest_port: int = Field(default=16333, ge=1, le=65535)
+    spatial_qdrant_grpc_port: int = Field(default=16334, ge=1, le=65535)
+    spatial_qdrant_collection: str = Field(
+        default="aic_batch1_reduce_beit3_spatial_v1"
+    )
+    spatial_qdrant_timeout_seconds: float = Field(default=10.0, gt=0.0)
+    spatial_qdrant_top_k: int = Field(default=500, ge=10, le=2000)
+    spatial_qdrant_per_axis_limit: int = Field(default=600, ge=10, le=3000)
+    spatial_qdrant_rrf_k: int = Field(default=30, ge=1, le=200)
+    spatial_beit3_rrf_weight: float = Field(default=1.0, ge=0.0, le=3.0)
+    # Small, feature-gated visual adjustments for known hard classes.  These
+    # do not replace RRF: layout queries give BEiT-3 a bounded lift because it
+    # often detects slide/cartoon structure alone; temporal queries give the
+    # visual family a modest lift before KCP sequence handling.
+    rrf_visual_specialist_enabled: bool = Field(default=True)
+    rrf_layout_visual_multiplier: float = Field(default=1.10, ge=1.0, le=2.0)
+    rrf_layout_beit3_multiplier: float = Field(default=1.35, ge=1.0, le=3.0)
+    rrf_temporal_visual_multiplier: float = Field(default=1.10, ge=1.0, le=2.0)
+    # Optional UI-selectable multimodal ablations.  These are family weights
+    # (the visual weight is divided across the visual encoder lanes) rather
+    # than raw cosine weights.  The text-specialist lane intentionally has a
+    # larger share in the two mixed modes; ``none`` keeps the production RRF
+    # weights above unchanged.
+    multimodal_visual_weight: float = Field(default=0.35, ge=0.0)
+    multimodal_text_weight: float = Field(default=0.65, ge=0.0)
+    # Production-correct KCP aggregation ranks events from every candidate
+    # video. It must never filter by a labeled/ground-truth video as the
+    # original offline oracle did.
+    rrf_kcp_enabled: bool = Field(default=True)
+    rrf_kcp_segments_path: Path = Field(
+        default=Path("/home/bachdx/Final_AIC/data/runtime/event_segments_p25.json")
+    )
+    rrf_kcp_nearest_tolerance: int = Field(default=60, ge=0, le=1000)
+    rrf_kcp_frames_per_event: int = Field(default=3, ge=1, le=10)
+    rrf_kcp_member_gap_frames: int = Field(default=75, ge=0, le=5000)
+    # First preserve one frame from each of the strongest events, then
+    # interleave alternative frames. This balances event and frame recall.
+    rrf_kcp_primary_event_head: int = Field(default=10, ge=1, le=100)
+    # Number of ranked KCP events considered when collapsing the independent
+    # Video-Lock event shortlist to videos. This is separate from any VLM
+    # setting because Qwen is not part of the current production path.
+    rrf_kcp_event_candidate_limit: int = Field(default=32, ge=1, le=256)
+    # Lock-Video may use a wider KCP event tail for discovery; the ordinary
+    # deep path keeps the audited 32-event budget.
+    rrf_kcp_lock_event_candidate_limit: int = Field(
+        default=128, ge=32, le=512
+    )
+    # Optional KIS/QA second pass: collapse global candidates to videos, scan
+    # all stored visual vectors inside that shortlist, then aggregate the new
+    # hits by KCP event. Disabled by default until the online ablation passes.
+    rrf_kcp_deep_search_enabled: bool = Field(default=False)
+    rrf_kcp_deep_search_video_limit: int = Field(default=50, ge=1, le=100)
+    # Explicit Lock-Video keeps a wider GT-free video shortlist than the
+    # ordinary deep-caption path.  Only ``rrf_kcp_lock_local_video_limit``
+    # videos proceed to expensive in-video visual search.
+    rrf_kcp_lock_shortlist_limit: int = Field(default=100, ge=50, le=100)
+    rrf_kcp_lock_local_video_limit: int = Field(default=50, ge=10, le=100)
+    # Lock-only clause probes trade a little FAISS work for recall on long
+    # multi-scene queries; the ordinary full-query path keeps candidate_k.
+    rrf_kcp_lock_clause_candidate_limit: int = Field(
+        default=1000, ge=100, le=5000
+    )
+    rrf_kcp_deep_search_visual_quota: int = Field(default=5, ge=0, le=50)
+    rrf_kcp_deep_search_frames_per_video: int = Field(default=24, ge=1, le=200)
+    rrf_kcp_deep_caption_per_video: int = Field(default=8, ge=1, le=100)
+    # Experimental online version of the successful video-lock caption pass:
+    # BGE retrieves caption events inside the video shortlist, then PhoBERT
+    # reranks at most ``rrf_kcp_deep_caption_per_video`` events per video with
+    # the original Vietnamese query.  It never uses a labelled/GT video.
+    rrf_kcp_deep_caption_phobert_enabled: bool = Field(default=False)
+    rrf_kcp_deep_caption_phobert_batch_size: int = Field(
+        default=32, ge=1, le=256
+    )
+    # Deep local scenes supplement rather than replace the proven baseline.
+    rrf_kcp_deep_protect_top_n: int = Field(default=20, ge=0, le=100)
+    rrf_kcp_deep_rescue_limit: int = Field(default=10, ge=0, le=50)
+    rrf_kcp_deep_sequence_enabled: bool = Field(default=True)
+    rrf_temporal_event_coherence_enabled: bool = Field(default=True)
+    rrf_temporal_event_coherence_bonus: float = Field(
+        default=0.10, ge=0.0, le=0.25
+    )
+    # Lock-video dense sampling is restricted to layout/temporal queries. It
+    # adds a few evenly spaced keyframes after midpoint coverage, preserving
+    # the normal low-cost path for ordinary queries.
+    rrf_lock_dense_sampling_enabled: bool = Field(default=True)
+    rrf_lock_dense_sampling_frames: int = Field(default=3, ge=1, le=5)
+    # Retained only as an explicit experimental fallback. KCP event
+    # boundaries supersede arbitrary fixed-gap shot windows.
+    rrf_shot_clustering_enabled: bool = Field(default=False)
+    rrf_shot_gap_frames: int = Field(default=75, ge=1, le=1000)
+    rrf_shot_lane_bonus: float = Field(default=0.15, ge=0.0, le=1.0)
+    # SPLIT per encoder, not one shared value — 2026-08-10 live diagnostic
+    # (query "weather forecast bulletin with a storm") found PE-Core's own
+    # top-1 raw cosine was 0.2299 while BEiT-3's was 0.6098 for the SAME
+    # query: the two encoders' raw cosine scales are not comparable at all.
+    # The single visual_score_threshold this replaced had been raised to
+    # 0.6 while tuning against the POST-FUSION diagnostic field (which is
+    # always exactly ensemble_pe_core_weight=0.5 for an uncorroborated
+    # single-model hit, regardless of the real raw score) — a scale mixup
+    # that made PE-Core clear 0/50 of its own top candidates against a
+    # threshold tuned for BEiT-3's much higher range, so cross-model
+    # corroboration (visual_rrf_weight comment above) could never find an
+    # intersection and PE-Core was silently disabled query-wide. Defaults
+    # below restore PE-Core to its pre-2026-08-10 tuning value (0.20, which
+    # was never actually the problem) and pick a BEiT-3 value below its
+    # observed ~0.55-0.65 range for genuine matches — both are a single
+    # real data point, not a calibrated sweep; revisit with labeled queries.
+    pe_core_score_threshold: float = Field(default=0.20)
+    beit3_score_threshold: float = Field(default=0.40)
+    # SigLIP2's sigmoid-loss training gives it yet another raw cosine scale
+    # from PE-Core/BEiT-3 (both contrastive-softmax); this is an
+    # uncalibrated starting point (same caveat as pe_core/beit3 above, not a
+    # labeled sweep) pending real query data once the index is built.
+    siglip2_score_threshold: float = Field(default=0.20)
+    # Encoder-specific calibration ceilings for bounded confidence bonuses.
+    # Raw cosine values are never compared directly across model families.
+    pe_core_score_ceiling: float = Field(default=0.35)
+    beit3_score_ceiling: float = Field(default=0.70)
+    siglip2_score_ceiling: float = Field(default=0.50)
+    audio_confidence_floor: float = Field(default=0.50)
+    audio_confidence_ceiling: float = Field(default=0.80)
+    ocr_confidence_floor: float = Field(default=0.55)
+    ocr_confidence_ceiling: float = Field(default=0.90)
+    caption_confidence_floor: float = Field(default=0.65)
+    caption_confidence_ceiling: float = Field(default=0.90)
+
+    # KIS hybrid-v2 additions. Bonuses are deliberately bounded and small;
+    # they refine weighted RRF rather than replacing it with raw-score fusion.
+    fusion_visual_window_seconds: float = Field(default=3.0, gt=0.0)
+    fusion_confidence_bonus: float = Field(default=0.012, ge=0.0)
+    fusion_visual_consensus_bonus: float = Field(default=0.018, ge=0.0)
+    fusion_multimodal_consensus_bonus: float = Field(default=0.012, ge=0.0)
+    fusion_specialist_bonus: float = Field(default=0.018, ge=0.0)
+    fusion_specialist_confidence_gate: float = Field(default=0.60, ge=0.0, le=1.0)
+    fusion_topic_group_bonus: float = Field(default=0.010, ge=0.0)
+    fusion_topic_rank_head: int = Field(default=10, gt=0)
+    # Experimental TRAKE-only Qwen action sequence prior. Disabled by
+    # default: the 2026-08-20 live lion replay increased latency materially
+    # without improving the likely target video's rank.
+    trake_action_prior_enabled: bool = Field(default=False)
+    trake_action_prior_weight: float = Field(default=0.70, ge=0.0)
+    # Explicit anchor/video-locked TRAKE. KIS identifies one video; DeepSeek
+    # Vision then scans a bounded temporal window in that video.
+    trake_anchor_max_window_seconds: float = Field(default=180.0, gt=0.0, le=600.0)
+    trake_anchor_candidate_limit: int = Field(default=350, ge=2, le=600)
+    trake_anchor_refine_enabled: bool = Field(default=True)
+    trake_anchor_refine_window_seconds: float = Field(default=1.0, gt=0.0, le=5.0)
+    trake_anchor_refine_scan_fps: float = Field(default=5.0, gt=0.0, le=5.0)
+    # Exact-event refinement keeps a wider temporal context to show the
+    # movement before the coarse frame, while limiting the Vision filmstrip
+    # to a readable number of exact frames.
+    trake_anchor_refine_lookback_seconds: float = Field(default=2.0, ge=0.0, le=10.0)
+    trake_anchor_refine_lookahead_seconds: float = Field(default=4.0, ge=0.0, le=5.0)
+    trake_anchor_refine_max_frames: int = Field(default=24, ge=2, le=24)
+    # Minimum score before an OCR/caption hit counts toward RRF fusion at
+    # all. None (default, off) preserves current behavior. Added 2026-08-09
+    # after a real query about a private space rocket launch surfaced an
+    # unrelated economics-review slide at ocr_score=0.61 — Vietnamese
+    # syllable-level tokenization (extract_keywords has no compound-word
+    # awareness: "giới thiệu" -> "gioi"+"thieu", "vũ trụ" -> "vu"+"tru")
+    # produces many generic single-syllable keywords for any sufficiently
+    # long query, and dense OCR slides coincidentally match several of them
+    # by sheer vocabulary coverage even with zero topical overlap. A
+    # stopword-list fix alone cannot close this — proper Vietnamese
+    # compound-word segmentation would, but that's a larger follow-up, not
+    # this fix. Off by default until validated (see scripts/ablation_rrf.py
+    # / scripts/batch_test_queries.py) since too-aggressive a threshold
+    # would also cut real short matches.
+    # Keep enough lexical representatives before frame-map expansion so
+    # inherited frames are not discarded by a small top-k pool.
+    ocr_expansion_candidate_limit: int = Field(default=2000, ge=1, le=10000)
+    ocr_score_threshold: Optional[float] = Field(default=None)
+    caption_score_threshold: Optional[float] = Field(default=None)
+    # Query-adaptive weighted RRF: route per-ranker RRF weight by query
+    # intent (screen-text/speech) instead of trusting every
+    # modality equally. Project-original heuristic in the weighted-RRF
+    # family (NOT a port of MMMORRF arXiv:2503.20698 — see
+    # src/search/query_intent.py for the provenance correction). Off by
+    # default until validated against labeled queries via
+    # scripts/ablation_rrf.py.
+    query_adaptive_rrf_enabled: bool = Field(default=False)
+
+    # Caption ranker rank_cutoff (Bruch et al. SIGIR 2022 style noisy-ranker
+    # mitigation, reciprocal_rank_fusion()'s existing rank_cutoff mechanism —
+    # was previously wired only into src/eval/ablation.py, never into this
+    # production search() call). None (default) disables it, matching prior
+    # behavior. First real evidence for a nonzero value: a UIT-OpenViIC eval
+    # (2026-07-29, 300 held-out captions) where caption's keyword-match
+    # ranker — noisy because src/search/query_utils.py::extract_keywords had
+    # a near-total stopword-filtering bug at the time — dragged R@1 from
+    # 56.3% (visual-only) to 40.3% under equal-weight RRF; rank_cutoff=1 on
+    # the caption ranker recovered R@1 to 49.0% while still beating
+    # visual-only at R@5/R@10. That stopword bug is now fixed too, which
+    # changes the caption ranker's noise profile — the cutoff=1 result above
+    # predates the stopword fix and has NOT been re-validated against it, so
+    # 2026-08-10: turned on (was off pending the stopword fix re-validation
+    # noted above) after live eye-checked queries reproduced the same class
+    # of caption over-ranking this cutoff was built to fix — a caption hit
+    # ranked outside its own top-1 has clearly weaker evidence than one at
+    # its own rank 1, so let RRF see only the strongest caption candidate
+    # per query instead of every caption rank contributing.
+    caption_rank_cutoff: Optional[int] = Field(default=5)
+
+    # Reranking the top of the RRF-fused list using the SAME raw PE-Core/
+    # BEiT-3 embeddings ranking already relies on (fetched via FAISS
+    # IndexFlatIP.reconstruct() — cheap, since it's an exact flat index, not
+    # an ANN structure). A text cross-encoder (e.g. a Jina reranker) was
+    # considered and rejected: it cannot see the frame at all, only
+    # whatever OCR/caption/ASR text happens to be attached, which covers a
+    # small minority of frames (~13% OCR, ~18% caption) — see
+    # aic2026-backend-api-gap memory. This instead combines BOTH encoders'
+    # raw cosine similarity for the FULL RRF-fused candidate set, catching
+    # candidates that search_visual_ensemble's per-ranker top_m cutoff
+    # dropped (a candidate PE-Core ranked 80th never gets combined with
+    # BEiT-3 today, even if BEiT-3 scored it highly). Off by default until
+    # validated against labeled queries — same rationale as
+    # query_adaptive_rrf_enabled/caption_rank_cutoff above.
+    embedding_rerank_enabled: bool = Field(default=False)
+    embedding_rerank_top_n: int = Field(default=50, gt=0)
+
+    # Cascade verification: re-scores only candidates that RRF surfaced
+    # through OCR/ASR/caption text (not independently found by PE-Core/
+    # BEiT-3) by reconstructing that exact frame's already-indexed visual
+    # vectors and checking raw cosine agreement with the query. See
+    # src/search/cascade_verification.py's module docstring for the
+    # 2026-08-15 ground-truth evaluation (27 real queries: recall@5 0.333 ->
+    # 0.370 at these defaults, no query regressed). Off by default —
+    # evaluated on a small sample, not yet validated against the full
+    # competition query set or re-checked after a corpus/index rebuild.
+    cascade_verification_enabled: bool = Field(default=False)
+    cascade_agree_threshold: float = Field(default=0.30)
+    cascade_disagree_threshold: float = Field(default=0.15)
+    cascade_boost_weight: float = Field(default=0.15)
+    cascade_penalty: float = Field(default=0.3)
+
+    # API server
+    host: str = Field(default="0.0.0.0")
+    port: int = Field(default=8000)
+    api_workers: int = Field(default=1)
+    log_level: str = Field(default="INFO")
+    # Keep Final_AIC startup lazy by default. Enable this after the model cache
+    # is staged for the competition service; preflight itself never warms GPU
+    # models or runs a full query.
+    startup_warmup_enabled: bool = Field(default=False)
+    # Comma-separated origins, or "*" for all (LAN-only competition deploy).
+    cors_origins: str = Field(default="*")
+
+    # Frontend
+    streamlit_port: int = Field(default=8501)
+
+    # Caching
+    enable_query_cache: bool = Field(default=True)
+    query_cache_max_size: int = Field(default=500)
+    query_cache_ttl_seconds: int = Field(default=3600)
+
+    # Gemini
+    gemini_api_key: Optional[str] = Field(default=None)
+
+    # Query translation (Vietnamese -> English for the PE-Core/BEiT-3 visual path
+    # only; PhoBERT ASR/OCR paths stay Vietnamese). API key via env, never
+    # hardcoded. Falls back offline when the API is unreachable (competition).
+    deepseek_api_key: Optional[str] = Field(default=None)
+    # Shared final reasoning layer for KIS, QA and TRAKE. DeepSeek V4 is
+    # text-only, so it receives compact OCR/ASR/caption/model-score evidence
+    # for the 15 candidates retained by Qwen. The global switch is off
+    # until an ablation beats the deterministic local baseline.
+    deepseek_rerank_enabled: bool = Field(default=False)
+    deepseek_rerank_kis_enabled: bool = Field(default=True)
+    deepseek_rerank_qa_enabled: bool = Field(default=True)
+    deepseek_rerank_trake_enabled: bool = Field(default=True)
+    deepseek_rerank_model: str = Field(default="deepseek-v4-flash")
+    deepseek_rerank_base_url: str = Field(default="https://api.deepseek.com")
+    deepseek_rerank_candidate_limit: int = Field(default=15, gt=1, le=40)
+    deepseek_rerank_max_tokens: int = Field(default=200, gt=0, le=1000)
+    deepseek_rerank_kis_timeout_seconds: float = Field(default=2.5, gt=0.0)
+    deepseek_rerank_qa_timeout_seconds: float = Field(default=4.0, gt=0.0)
+    deepseek_rerank_trake_timeout_seconds: float = Field(default=6.0, gt=0.0)
+    # Optional per-request visual critic.  This is deliberately independent
+    # from the legacy text-only DeepSeek reranker above: the frontend may turn
+    # it on for a difficult query without changing the normal fast path.
+    deepseek_vision_enabled: bool = Field(default=True)
+    deepseek_vision_model: str = Field(default="deepseek-v4-flash-vision-exp")
+    deepseek_vision_base_url: str = Field(default="https://api.deepseek.com")
+    deepseek_vision_timeout_seconds: float = Field(default=180.0, gt=0.0)
+    # Maximum localized frame candidates sent to the second vision pass.
+    # The final API response is still capped separately at 50 frames.
+    deepseek_vision_candidate_limit: int = Field(default=350, ge=1, le=600)
+    # Wider coarse pass used only when the optional DeepSeek path is enabled.
+    deepseek_vision_first_pass_limit: int = Field(default=350, ge=2, le=600)
+    # Wider event coverage is needed for the 350-frame coarse vision pass.
+    deepseek_vision_event_limit: int = Field(default=20, ge=1, le=32)
+    # Agent-style independent event/video shortlist. The second pass still
+    # has a hard frame budget, so expanding this list improves video recall
+    # without changing the final 50-frame response contract.
+    deepseek_vision_locked_video_limit: int = Field(default=50, ge=5, le=50)
+    deepseek_vision_frames_per_event: int = Field(default=50, ge=1, le=100)
+    deepseek_vision_pool_limit: int = Field(default=600, ge=100, le=600)
+    deepseek_vision_image_size: int = Field(default=640, ge=256, le=1280)
+    deepseek_vision_jpeg_quality: int = Field(default=68, ge=35, le=90)
+    # Remote visual critic. Retrieval first collects 100 local candidates and
+    # deterministically reduces them to 25 (including OCR/ASR/caption escape
+    # candidates). Qwen ranks all 25; DeepSeek then sees only Qwen's top 15.
+    final_rerank_pool_size: int = Field(default=100, ge=15, le=500)
+    qwen_rerank_enabled: bool = Field(default=False)
+    # Qwen final reranking is retired from the production path.  Keep the
+    # fields for backwards-compatible config parsing, but require an explicit
+    # opt-in in a future experiment for every task.
+    qwen_rerank_kis_enabled: bool = Field(default=False)
+    qwen_rerank_qa_enabled: bool = Field(default=False)
+    qwen_rerank_trake_enabled: bool = Field(default=False)
+    qwen_rerank_base_url: str = Field(default="http://127.0.0.1:8700")
+    # Keep the broader candidate pool used by the validated event-ranking
+    # variant. The response/output limits remain unchanged.
+    qwen_rerank_candidate_limit: int = Field(default=32, gt=1, le=40)
+    qwen_rerank_kis_timeout_seconds: float = Field(default=20.0, gt=0.0)
+    qwen_rerank_qa_timeout_seconds: float = Field(default=20.0, gt=0.0)
+    qwen_rerank_trake_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    qwen_rerank_image_size: int = Field(default=384, ge=224, le=768)
+    # Off by default: enabling changes visual-path retrieval, so turn on only
+    # after validating translation quality against labeled queries.
+    translation_enabled: bool = Field(default=False)
+    translation_backend: Literal["deepseek", "nllb", "identity"] = Field(
+        default="deepseek"
+    )
+    translation_model: Optional[str] = Field(default=None)
+    translation_offline_fallback: Literal["identity", "nllb"] = Field(
+        default="identity"
+    )
+    translation_cache_path: Optional[Path] = Field(
+        default=Path("./data/index/translation_cache.json")
+    )
+
+    # HuggingFace
+    hf_token: Optional[str] = Field(default=None)
+
+    # Performance
+    num_loader_threads: int = Field(default=4)
+    pe_core_batch_size: int = Field(default=32)
+    preload_visual_features: bool = Field(default=False)
+
+    def resolve_path(self, path: Path) -> Path:
+        """Resolve a path, expanding ${DATA_ROOT} and relative paths."""
+        path_str = str(path)
+        if path_str.startswith("${DATA_ROOT}"):
+            path_str = path_str.replace("${DATA_ROOT}", str(self.data_root))
+        resolved = Path(path_str)
+        # On Windows, ``\rooted`` has a root but no drive. Preserve it instead
+        # of silently rebasing it to the current drive/directory.
+        if not resolved.is_absolute() and not resolved.root:
+            resolved = Path.cwd() / resolved
+        return resolved
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Get cached settings singleton."""
+    return Settings()

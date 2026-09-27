@@ -1,0 +1,48 @@
+# Environments & Secrets
+.env
+.env.*
+!.env.example
+
+# Large Data & Storage Directories
+data/
+database/
+database
+models/
+models
+offline_tools/
+offline_tools
+storage/
+storage
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.tar.gz
+*.zip
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Logs & PIDs
+*.log
+*.pid
+
+# Python cache & venv
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.venv/
+
+# Node.js
+node_modules/
+dist/
+.npm/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

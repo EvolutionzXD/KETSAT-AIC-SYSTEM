@@ -1,0 +1,131 @@
+"""OpenCLIP implementation of PE-Core (Perception Encoder) for
+:class:`VisualTextEncoder`.
+
+Loads Meta's PE-Core checkpoints via their OpenCLIP-remapped weights on the
+Hugging Face Hub (``hf-hub:timm/<model>``), using the standard pip-installed
+``open_clip`` package (already in requirements.txt) — NOT
+``facebookresearch/perception_models``, which requires Python 3.12 and a
+git-clone install and would be incompatible with the server's Python 3.8
+(see docs/SERVER_HANDOVER_CODEX.md). Verified 2026-07-27 against the
+``timm/PE-Core-L-14-336`` model card: ``open_clip.create_model_and_transforms``
++ ``model.encode_image(x, normalize=True)`` / ``model.encode_text(x,
+normalize=True)`` is the documented, working entry point. Requires
+``open-clip-torch>=3.0.0`` (PE-Core configs landed in that release).
+
+Default checkpoint is ``PE-Core-L-14-336`` (1024-dim), matching the backbone
+UniversalVTG already uses (see src/grounding/universalvtg_adapter.py) so both
+pipeline stages share one encoder family instead of three incompatible ones.
+"""
+from typing import Any, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+from loguru import logger
+
+from src.encoders.base import VisualTextEncoder
+
+#: PE-Core-L-14-336: same backbone already used by UniversalVTG grounding.
+DEFAULT_PE_CORE_MODEL_ID = "hf-hub:timm/PE-Core-L-14-336"
+
+
+class PECoreEncoder(VisualTextEncoder):
+    """Lazy-loading PE-Core (Perception Encoder) dual encoder via open_clip."""
+
+    encoder_type = "pe_core"
+
+    def __init__(
+        self,
+        model_id: str = DEFAULT_PE_CORE_MODEL_ID,
+        device: Optional[torch.device] = None,
+    ):
+        if not model_id.strip():
+            raise ValueError("model_id must be non-empty")
+        self._model_id = model_id
+        self._device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self._model = None
+        self._preprocess = None
+        self._tokenizer = None
+        self._embedding_dim: Optional[int] = None
+
+    @property
+    def checkpoint(self) -> str:
+        return self._model_id
+
+    @property
+    def embedding_dim(self) -> int:
+        self._load()
+        return self._embedding_dim
+
+    def _load(self) -> Tuple[Any, Any, Any]:
+        if self._model is not None:
+            return self._model, self._preprocess, self._tokenizer
+
+        try:
+            import open_clip
+        except ImportError as e:
+            raise ImportError(
+                f"open_clip missing or too old ({e}). PE-Core requires "
+                "open-clip-torch>=3.0.0: pip install -U open-clip-torch"
+            ) from e
+
+        logger.info(f"Loading PE-Core model: {self._model_id}")
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            self._model_id
+        )
+        # Keep the text tower in FP32 on CUDA.  The persisted visual vectors
+        # were produced in FP32 and FP16 query embeddings can perturb cosine
+        # scores enough to reorder tightly clustered frames before RRF/KCP.
+        # GPU FP32 retains acceleration while matching the index precision.
+        if str(self._device).startswith("cuda") and hasattr(model, "text"):
+            # KIS calls only the text tower. Keeping the much larger vision
+            # tower on CPU avoids wasting scarce shared VRAM; image search
+            # automatically follows the vision tower's actual device below.
+            model.text = model.text.to(self._device)
+            self._text_device = self._device
+        else:
+            model = model.to(self._device)
+            self._text_device = self._device
+        model.eval()
+        tokenizer = open_clip.get_tokenizer(self._model_id)
+
+        self._model = model
+        self._preprocess = preprocess
+        self._tokenizer = tokenizer
+
+        # Don't rely on a specific model-internal attribute name for the
+        # embedding dim: open_clip loads different classes depending on the
+        # checkpoint (plain CLIP vs CustomTextCLIP for hf-hub remaps), and
+        # they don't expose it consistently — CustomTextCLIP raised
+        # AttributeError on 'embed_dim' at runtime despite it appearing in
+        # source (verified on open_clip 3.3.0, python:3.9-slim, 2026-07-27).
+        # Inferring from a real encode call is correct regardless of class.
+        with torch.no_grad():
+            probe = model.encode_text(tokenizer(["warmup"]).to(self._text_device))
+        self._embedding_dim = int(probe.shape[-1])
+        logger.info(
+            f"PE-Core loaded on {self._device}, "
+            f"embedding_dim={self._embedding_dim}"
+        )
+        return self._model, self._preprocess, self._tokenizer
+
+    def encode_images(self, images: Sequence[Any]) -> np.ndarray:
+        model, preprocess, _ = self._load()
+        visual_device = next(model.visual.parameters()).device
+        visual_dtype = next(model.visual.parameters()).dtype
+        batch = torch.stack(
+            [preprocess(image.convert("RGB")) for image in images]
+        ).to(visual_device, dtype=visual_dtype)
+        with torch.no_grad():
+            feats = model.encode_image(batch, normalize=True)
+        return feats.float().cpu().numpy().astype(np.float32)
+
+    def encode_texts(self, texts: Sequence[str]) -> np.ndarray:
+        model, _, tokenizer = self._load()
+        tokens = tokenizer(
+            list(texts), context_length=model.context_length
+        ).to(self._text_device)
+        with torch.no_grad():
+            feats = model.encode_text(tokens, normalize=True)
+        return feats.float().cpu().numpy().astype(np.float32)
